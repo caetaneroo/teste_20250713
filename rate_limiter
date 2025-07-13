@@ -24,11 +24,12 @@ class AdaptiveRateLimiter:
     - Não gerencia stats internamente; reporta para stats_manager.
     - Logs minimizados para eventos relevantes apenas.
     - Tratamento reativo para erros de rate limit: extrai tempo de espera da resposta de erro e aplica pausa global.
+    - Unificação de limites: usa tpm_limit como base, com buffer dinâmico (inicial 90%, ajustável via tendências).
     """
 
-    def __init__(self, max_tokens_per_minute: int = 180000, calibration_enabled: bool = True, api_tpm_limit: int = 125000):
-        self.max_tpm = max_tokens_per_minute
-        self.effective_tpm = int(api_tpm_limit * 0.9)  # Buffer de 10% para segurança
+    def __init__(self, tpm_limit: int = 125000, calibration_enabled: bool = True, buffer_percentage: float = 0.9):
+        self.tpm_limit = tpm_limit
+        self.effective_tpm = int(tpm_limit * buffer_percentage)  # Buffer inicial para segurança, ajustável dinamicamente
         self.tokens_used_this_minute = 0
         self.minute_start = time.time()
         self._lock = asyncio.Lock()
@@ -45,11 +46,12 @@ class AdaptiveRateLimiter:
         self._current_batch_id = None
         self.api_rate_limits_detected = 0
         self.prevented_rate_limits = 0
+        self.utilization_history = deque(maxlen=60)  # Histórico de utilização por minuto para ajustes dinâmicos
 
         logger.info(
             "AdaptiveRateLimiter inicializado",
             extra={
-                'max_tpm': max_tokens_per_minute,
+                'tpm_limit': tpm_limit,
                 'effective_tpm': self.effective_tpm,
                 'calibration_enabled': calibration_enabled,
                 'action': 'rate_limiter_init'
@@ -86,7 +88,7 @@ class AdaptiveRateLimiter:
         return int(base_estimate * self.calibration_factor) if self.calibration_enabled else base_estimate
 
     async def wait_for_tokens(self, estimated_tokens: int) -> int:
-        """Espera por tokens com pausas proativas baseadas em effective_tpm."""
+        """Espera por tokens com pausas proativas baseadas em effective_tpm, ajustando buffer dinamicamente."""
         async with self._rate_limit_lock:
             current_time = time.time()
             if self._global_rate_limit_active and current_time < self._global_wait_until:
@@ -100,6 +102,10 @@ class AdaptiveRateLimiter:
             async with self._lock:
                 current_time = time.time()
                 if current_time - self.minute_start >= 60:
+                    # Registra utilização do minuto anterior e ajusta buffer
+                    utilization = (self.tokens_used_this_minute / self.tpm_limit) * 100 if self.tpm_limit > 0 else 0
+                    self.utilization_history.append(utilization)
+                    self._adjust_buffer()
                     self.tokens_used_this_minute = 0
                     self.minute_start = current_time
                 if self.tokens_used_this_minute + calibrated_tokens > self.effective_tpm:
@@ -111,6 +117,19 @@ class AdaptiveRateLimiter:
                         self.minute_start = time.time()
                         self.prevented_rate_limits += 1
             return calibrated_tokens
+
+    def _adjust_buffer(self) -> None:
+        """Ajusta buffer dinamicamente baseado em tendências de utilização (ex.: reduz se baixa para maximizar throughput)."""
+        if len(self.utilization_history) < 5:
+            return
+        avg_utilization = sum(self.utilization_history) / len(self.utilization_history)
+        if avg_utilization < 70:
+            new_buffer = min(0.95, (self.effective_tpm / self.tpm_limit) + 0.05)  # Aumenta effective_tpm
+        elif avg_utilization > 90:
+            new_buffer = max(0.85, (self.effective_tpm / self.tpm_limit) - 0.05)  # Reduz para mais segurança
+        else:
+            new_buffer = 0.9
+        self.effective_tpm = int(self.tpm_limit * new_buffer)
 
     async def activate_global_rate_limit(self, wait_time: float):
         """Ativa pausa global apenas quando necessário."""
