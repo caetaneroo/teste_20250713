@@ -2,21 +2,35 @@
 
 import time
 import logging
+import json
+import os
 from dataclasses import dataclass, field
-from typing import Dict, Any, List
+from typing import Dict, Any, Optional
 from collections import deque
 
 logger = logging.getLogger(__name__)
 
-# Tabela de preços (mantida, mas pode ser carregada de config se necessário)
-MODEL_PRICING = {
-    'gpt-35-turbo-16k': {'input': 0.0015, 'output': 0.002, 'cache': 0.00075},
-    # ... (restante da tabela omitido por brevidade; mantenha como no original)
-}
+def load_models_config(config_path: str = "models.json") -> Dict[str, Any]:
+    """Carrega configuração dos modelos a partir do arquivo JSON."""
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Arquivo {config_path} não encontrado. Este arquivo é obrigatório.")
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            models_config = json.load(f)
+        if not models_config:
+            raise ValueError(f"Arquivo {config_path} está vazio ou inválido.")
+        return models_config
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Erro ao decodificar JSON em {config_path}: {e}")
+    except Exception as e:
+        raise RuntimeError(f"Erro ao carregar {config_path}: {e}")
+
+# Carrega configuração dos modelos uma vez no init do módulo
+MODELS_CONFIG = load_models_config()
 
 @dataclass
 class Stats:
-    """Classe centralizada para stats de batch ou global, incluindo calibração e rate limiting."""
+    """Classe centralizada para stats de batch ou global, incluindo calibração, rate limiting e métricas refinadas."""
     total_requests: int = 0
     successful_requests: int = 0
     failed_requests: int = 0
@@ -27,9 +41,10 @@ class Stats:
     processing_time: float = 0.0
     start_time: float = field(default_factory=time.time)
     total_api_response_time: float = 0.0
+    total_wait_time: float = 0.0
+    total_retry_time: float = 0.0
     min_response_time: float = float('inf')
     max_response_time: float = 0.0
-    total_wait_time: float = 0.0
     retry_attempts: int = 0
     concurrent_peak: int = 0
     errors_by_type: Dict[str, int] = field(default_factory=dict)
@@ -38,7 +53,7 @@ class Stats:
     coordinated_wait_time: float = 0.0
     cost_breakdown: Dict[str, float] = field(default_factory=dict)
     model_used: str = ""
-    # Novas métricas centralizadas de calibração
+    # Métricas centralizadas de calibração
     calibration_factor: float = 1.0
     calibration_accuracy: float = 0.0
     total_calibrations: int = 0
@@ -63,7 +78,7 @@ class Stats:
     @property
     def efficiency_rate(self) -> float:
         total_time = self.processing_time
-        total_wait = self.total_wait_time + self.coordinated_wait_time
+        total_wait = self.total_wait_time + self.coordinated_wait_time + self.total_retry_time
         processing_time = max(0, total_time - total_wait)
         return (processing_time / total_time * 100) if total_time > 0 else 0.0
 
@@ -76,13 +91,12 @@ class Stats:
         total_input_and_cached = self.total_tokens_input + self.total_tokens_cached
         return (self.total_tokens_cached / total_input_and_cached * 100) if total_input_and_cached > 0 else 0.0
 
-    # Outras properties mantidas ou otimizadas como no original
-
 class StatsManager:
     """
-    Gerenciador centralizado de stats, agora incluindo calibração e rate limiting.
+    Gerenciador centralizado de stats, incluindo calibração, rate limiting e cálculos de custo.
     - Integra dados do rate_limiter para consistência.
-    - Suporta adaptação dinâmica via warm-up.
+    - Suporta adaptação dinâmica via warm-up e ETAs.
+    - Centraliza todo cálculo de pricing aqui, carregando de models.json para evitar duplicação.
     """
 
     def __init__(self):
@@ -113,11 +127,36 @@ class StatsManager:
         batch_stats.concurrent_peak = min(snapshot['batch_peak_concurrent'], self._max_concurrent_limit)
         return batch_stats
 
+    def calculate_cost(self, model: str, input_tokens: int, output_tokens: int, cached_tokens: int = 0) -> float:
+        """Cálculo centralizado de custo, usando preços carregados de models.json."""
+        if model not in MODELS_CONFIG:
+            logger.warning(f"Modelo '{model}' não encontrado em models.json. Usando preços fallback.")
+            pricing = {'input': 0.03, 'output': 0.06, 'cache': 0.015}  # Fallback
+        else:
+            model_data = MODELS_CONFIG[model]
+            pricing = {
+                'input': model_data.get('input', 0.03),
+                'output': model_data.get('output', 0.06),
+                'cache': model_data.get('cache', 0.015)
+            }
+        regular_input_tokens = max(0, input_tokens - cached_tokens)
+        regular_input_cost = (regular_input_tokens / 1000) * pricing['input']
+        cached_cost = (cached_tokens / 1000) * pricing['cache']
+        output_cost = (output_tokens / 1000) * pricing['output']
+        total_cost = regular_input_cost + cached_cost + output_cost
+        if cached_tokens > 0:
+            logger.debug(
+                f"Cálculo de custo: Modelo {model} | Input regular: {regular_input_tokens} (${regular_input_cost:.6f}) | Cached: {cached_tokens} (${cached_cost:.6f}) | Output: {output_tokens} (${output_cost:.6f}) | Total: ${total_cost:.6f}",
+                extra={'model': model, 'total_cost': total_cost, 'action': 'cost_calculation'}
+            )
+        return total_cost
+
     def record_request(self, success: bool, tokens_input: int = 0, tokens_output: int = 0, tokens_cached: int = 0,
-                       cost: float = 0.0, api_response_time: float = 0.0, error_type: Optional[str] = None,
-                       retry_count: int = 0, model: str = "") -> None:
-        """Registra requisição com custos e métricas centralizadas."""
+                       api_response_time: float = 0.0, wait_time: float = 0.0, retry_time: float = 0.0,
+                       error_type: Optional[str] = None, retry_count: int = 0, model: str = "") -> None:
+        """Registra requisição com custos e métricas refinadas (inclui separação de tempos)."""
         self.global_stats.total_requests += 1
+        cost = self.calculate_cost(model, tokens_input, tokens_output, tokens_cached)
         if success:
             self.global_stats.successful_requests += 1
             self.global_stats.total_api_response_time += api_response_time
@@ -130,13 +169,13 @@ class StatsManager:
         self.global_stats.total_tokens_input += tokens_input
         self.global_stats.total_tokens_output += tokens_output
         self.global_stats.total_tokens_cached += tokens_cached
+        self.global_stats.total_cost += cost
+        self.global_stats.total_wait_time += wait_time
+        self.global_stats.total_retry_time += retry_time
         self.global_stats.retry_attempts += retry_count
         if model:
             self.global_stats.model_used = model
-            pricing = MODEL_PRICING.get(model, {'input': 0.03, 'output': 0.06, 'cache': 0.015})  # Fallback
-            detailed_cost = (tokens_input / 1000 * pricing['input']) + (tokens_output / 1000 * pricing['output']) + (tokens_cached / 1000 * pricing['cache'])
-            self.global_stats.total_cost += detailed_cost
-            self.global_stats.cost_breakdown[model] = self.global_stats.cost_breakdown.get(model, 0) + detailed_cost
+            self.global_stats.cost_breakdown[model] = self.global_stats.cost_breakdown.get(model, 0) + cost
 
     def record_rate_limit_wait(self, wait_time: float) -> None:
         self.global_stats.total_wait_time += wait_time
@@ -146,7 +185,7 @@ class StatsManager:
         self.global_stats.api_rate_limits_detected += 1
 
     def record_token_usage_for_calibration(self, estimated: int, actual: int) -> None:
-        """Centraliza calibração aqui para precisão."""
+        """Centraliza calibração com precisão e weights."""
         if actual <= 0 or estimated <= 0:
             return
         ratio = actual / estimated
@@ -160,11 +199,11 @@ class StatsManager:
             self._recalibrate()
 
     def _recalibrate(self) -> None:
-        """Recalibração centralizada com weights."""
+        """Recalibração centralizada com weights priorizando recentes."""
         history = list(self.global_stats.usage_history)[-200:]
         total_weight = sum((i + 1) for i in range(len(history)))
         weighted_sum = sum(entry['ratio'] * (i + 1) for i, entry in enumerate(history))
-        avg_ratio = weighted_sum / total_weight
+        avg_ratio = weighted_sum / total_weight if total_weight > 0 else 1.0
         self.global_stats.calibration_factor = max(0.3, min(3.0, (avg_ratio * 0.6) + (self.global_stats.calibration_factor * 0.4)))
 
     def record_concurrent_start(self) -> None:
@@ -184,5 +223,26 @@ class StatsManager:
 
     def format_stats(self, stats: Stats, title: str = "Stats") -> str:
         """Formatação otimizada e concisa para output em notebooks."""
-        # Implementação de formatação (mantida como no original, otimizada para brevidade)
-        pass  # Adicione a implementação completa se necessário, mas para este exemplo, assume-se otimizada.
+        lines = [f"--- {title} ---"]
+        lines.append(f"Total Requests: {stats.total_requests}")
+        lines.append(f"Successful: {stats.successful_requests} ({stats.success_rate:.2f}%)")
+        lines.append(f"Failed: {stats.failed_requests}")
+        lines.append(f"Total Tokens: {stats.total_tokens} (Input: {stats.total_tokens_input}, Output: {stats.total_tokens_output}, Cached: {stats.total_tokens_cached})")
+        lines.append(f"Cache Hit Rate: {stats.cache_hit_rate:.2f}%")
+        lines.append(f"Total Cost: ${stats.total_cost:.6f} (Per Token: ${stats.cost_per_token:.8f})")
+        lines.append(f"Processing Time: {stats.processing_time:.2f}s (Efficiency: {stats.efficiency_rate:.2f}%)")
+        lines.append(f"Avg Response Time: {stats.avg_response_time:.2f}s (Min: {stats.min_response_time:.2f}s, Max: {stats.max_response_time:.2f}s)")
+        lines.append(f"Total Wait Time: {stats.total_wait_time:.2f}s | Total Retry Time: {stats.total_retry_time:.2f}s")
+        lines.append(f"Retry Attempts: {stats.retry_attempts}")
+        lines.append(f"Concurrent Peak: {stats.concurrent_peak}")
+        lines.append(f"Rate Limits Detected: {stats.api_rate_limits_detected} | Prevented: {stats.prevented_rate_limits}")
+        lines.append(f"Calibration Factor: {stats.calibration_factor:.3f} | Accuracy: {stats.calibration_accuracy:.2f}")
+        if stats.errors_by_type:
+            lines.append("Errors by Type:")
+            for err_type, count in stats.errors_by_type.items():
+                lines.append(f"  - {err_type}: {count}")
+        if stats.cost_breakdown:
+            lines.append("Cost Breakdown by Model:")
+            for model, cost in stats.cost_breakdown.items():
+                lines.append(f"  - {model}: ${cost:.6f}")
+        return "\n".join(lines)
