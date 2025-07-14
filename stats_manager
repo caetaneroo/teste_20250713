@@ -42,7 +42,7 @@ class StatsContainer:
     configured_max_concurrency: int = 0
 
     # --- Métricas de Rate Limiter ---
-    api_rate_limits_detected: int = 0  # **CORREÇÃO DEFINITIVA**: Atributo re-adicionado.
+    api_rate_limits_detected: int = 0
     proactive_pauses: int = 0
     total_proactive_wait_time: float = 0.0
     
@@ -116,6 +116,7 @@ class StatsManager:
         self._global_stats = StatsContainer(id="global")
         self._batch_stats: Dict[str, StatsContainer] = {}
         self._lock = asyncio.Lock()
+        self._last_batch_id: Optional[str] = None
         logger.info("StatsManager inicializado e pronto para gerar insights.")
 
     def _get_model_pricing(self, model: str) -> Dict[str, float]:
@@ -183,14 +184,22 @@ class StatsManager:
     def start_batch(self, batch_id: str):
         if batch_id in self._batch_stats:
             logger.warning(f"Batch com ID '{batch_id}' já existe. Sobrescrevendo estatísticas.")
+        self._last_batch_id = batch_id
         self._batch_stats[batch_id] = StatsContainer(id=batch_id)
         logger.info(f"Lote de estatísticas '{batch_id}' iniciado.")
 
     def end_batch(self, batch_id: str) -> Optional[StatsContainer]:
-        if batch_id in self._batch_stats:
-            self._batch_stats[batch_id].end_time = time.time()
-            return self._batch_stats[batch_id]
+        batch_stats = self._batch_stats.get(batch_id)
+        if batch_stats:
+            batch_stats.end_time = time.time()
+            # Atualiza o tempo final global para refletir o último lote concluído
+            self._global_stats.end_time = batch_stats.end_time
+            return batch_stats
         return None
+
+    def get_global_stats(self) -> StatsContainer:
+        """Retorna o objeto de estatísticas globais."""
+        return self._global_stats
 
     def _format_stats(self, stats: StatsContainer, title: str) -> str:
         """Formata um contêiner de estatísticas em uma string legível e rica em insights."""
@@ -231,7 +240,6 @@ class StatsManager:
 
         footer = "=" * 80
         
-        # **CORREÇÃO**: Explicação de concorrência removida do retorno final.
         return (f"\n{header}\n\n{summary}\n{parallelization}\n{performance}\n{cost_consumption}\n{reliability}\n{footer}\n")
 
     def get_summary(self, batch_id: Optional[str] = None) -> str:
@@ -240,12 +248,13 @@ class StatsManager:
         para um lote específico ou para as estatísticas globais.
         """
         if batch_id:
-            stats = self._batch_stats.get(batch_id)
+            stats_obj = self._batch_stats.get(batch_id)
             title = f"LOTE {batch_id}"
-            if not stats:
+            if not stats_obj:
                 return f"Erro: Nenhuma estatística encontrada para o lote com ID '{batch_id}'."
         else:
-            stats = self._global_stats
+            stats_obj = self._global_stats
             title = "GLOBAL"
         
-        return self._format_stats(stats, title)
+        return self._format_stats(stats_obj, title)
+
