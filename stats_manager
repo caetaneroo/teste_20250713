@@ -1,20 +1,18 @@
 import asyncio
 import time
 import logging
+import statistics
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 logger = logging.getLogger(__name__)
 
 @dataclass
 class StatsContainer:
     """
-    Um contêiner de dados para armazenar métricas de desempenho e custo.
-    
-    Utiliza propriedades para calcular métricas derivadas sob demanda, garantindo
-    que os valores estejam sempre atualizados e evitando a complexidade de
-    cálculos manuais em outros locais.
+    Um contêiner de dados otimizado para armazenar e calcular métricas de
+    desempenho e custo de forma precisa e eficiente.
     """
     # --- Identificação e Tempo ---
     id: str
@@ -34,8 +32,13 @@ class StatsContainer:
     total_cached_tokens: int = 0
     total_cost: float = 0.0
 
-    # --- Métricas de Latência ---
-    total_api_response_time: float = 0.0
+    # --- Rastreamento de Latência (Correção) ---
+    api_response_times: List[float] = field(default_factory=list)
+
+    # --- Rastreamento de Concorrência (Correção) ---
+    current_concurrent_requests: int = 0
+    concurrent_peak: int = 0  # O pico real observado
+    configured_max_concurrency: int = 0 # O último limite definido pelo RateLimiter
 
     # --- Métricas de Rate Limiter ---
     api_rate_limits_detected: int = 0
@@ -44,73 +47,47 @@ class StatsContainer:
     global_rate_limit_activations: int = 0
     total_global_wait_time: float = 0.0
     
-    # --- Métricas de Concorrência ---
-    current_concurrent_requests: int = 0
-    concurrent_peak: int = 0
-    configured_max_concurrency: int = 0
-
-    # --- Propriedades Calculadas ---
+    # --- Propriedades Calculadas (Refinadas) ---
     @property
     def processing_time(self) -> float:
-        """Calcula o tempo total de processamento."""
+        """Calcula o tempo total de processamento do contêiner (lote ou global)."""
         if self.end_time:
             return self.end_time - self.start_time
         return time.time() - self.start_time
 
     @property
     def total_tokens(self) -> int:
-        """Calcula o total de tokens (input + output)."""
         return self.total_input_tokens + self.total_output_tokens
 
     @property
-    def avg_rate(self) -> float:
-        """Calcula a taxa média de requisições por segundo."""
-        if self.processing_time > 0:
-            return self.total_requests / self.processing_time
-        return 0.0
-
-    @property
     def success_rate(self) -> float:
-        """Calcula a porcentagem de requisições bem-sucedidas."""
         if self.total_requests > 0:
             return (self.successful_requests / self.total_requests) * 100
-        return 0.0
+        return 100.0
+
+    # --- Novas Propriedades para Min, Max, Média ---
+    @property
+    def min_api_latency(self) -> float:
+        """Retorna a latência mínima da API, em milissegundos."""
+        return min(self.api_response_times) * 1000 if self.api_response_times else 0
+
+    @property
+    def max_api_latency(self) -> float:
+        """Retorna a latência máxima da API, em milissegundos."""
+        return max(self.api_response_times) * 1000 if self.api_response_times else 0
 
     @property
     def avg_api_latency(self) -> float:
-        """Calcula a latência média da API por requisição."""
-        if self.total_requests > 0:
-            return self.total_api_response_time / self.total_requests
-        return 0.0
-
-    @property
-    def avg_cost_per_request(self) -> float:
-        """Calcula o custo médio por requisição."""
-        if self.total_requests > 0:
-            return self.total_cost / self.total_requests
-        return 0.0
+        """Retorna a latência média da API, em milissegundos."""
+        return statistics.mean(self.api_response_times) * 1000 if self.api_response_times else 0
 
 
 class StatsManager:
     """
     Gerenciador centralizado para coletar, calcular e apresentar estatísticas.
-
-    Esta classe é a única fonte da verdade para todas as métricas do sistema.
-    Ela é responsável por:
-    - Rastrear estatísticas globais e por lote (batch).
-    - Calcular custos de requisição com base na configuração do modelo.
-    - Receber e interpretar eventos do RateLimiter.
-    - Fornecer uma formatação clara e informativa das estatísticas.
     """
 
     def __init__(self, models_config: Dict[str, Any]):
-        """
-        Inicializa o StatsManager.
-
-        Args:
-            models_config (Dict[str, Any]): A configuração carregada de `models.json`,
-                                           contendo preços e capacidades dos modelos.
-        """
         self._models_config = models_config
         self._global_stats = StatsContainer(id="global")
         self._batch_stats: Dict[str, StatsContainer] = {}
@@ -119,10 +96,7 @@ class StatsManager:
 
     def _get_model_pricing(self, model: str) -> Dict[str, float]:
         """Obtém os preços de um modelo a partir da configuração carregada."""
-        model_data = self._models_config.get(model)
-        if not model_data:
-            logger.warning(f"Preços para o modelo '{model}' não encontrados. Custo não será calculado.")
-            return {'input': 0.0, 'output': 0.0, 'cache': 0.0}
+        model_data = self._models_config.get(model, {})
         return {
             'input': model_data.get('input', 0.0),
             'output': model_data.get('output', 0.0),
@@ -132,18 +106,12 @@ class StatsManager:
     def _calculate_cost(
         self, model: str, input_tokens: int, output_tokens: int, cached_tokens: int = 0
     ) -> float:
-        """
-        Calcula o custo total de uma requisição, considerando tokens de input,
-        output e cache.
-        """
+        """Calcula o custo total de uma requisição."""
         pricing = self._get_model_pricing(model)
-        
-        regular_input_tokens = max(0, input_tokens - cached_tokens)
-        regular_input_cost = (regular_input_tokens / 1000) * pricing['input']
-        cached_cost = (cached_tokens / 1000) * pricing['cache']
-        output_cost = (output_tokens / 1000) * pricing['output']
-        
-        return regular_input_cost + cached_cost + output_cost
+        regular_input = max(0, input_tokens - cached_tokens)
+        return ((regular_input / 1000) * pricing['input'] +
+                (cached_tokens / 1000) * pricing['cache'] +
+                (output_tokens / 1000) * pricing['output'])
 
     async def _update_stats(self, stats: StatsContainer, **kwargs):
         """Função auxiliar para atualizar um contêiner de estatísticas de forma segura."""
@@ -153,8 +121,7 @@ class StatsManager:
             stats.successful_requests += 1
         else:
             stats.failed_requests += 1
-            error_type = kwargs.get('error_type', 'UnknownError')
-            stats.error_type_counts[error_type] += 1
+            stats.error_type_counts[kwargs.get('error_type', 'UnknownError')] += 1
         
         cost = self._calculate_cost(
             model=kwargs['model'],
@@ -167,25 +134,22 @@ class StatsManager:
         stats.total_input_tokens += kwargs.get('input_tokens', 0)
         stats.total_output_tokens += kwargs.get('output_tokens', 0)
         stats.total_cached_tokens += kwargs.get('cached_tokens', 0)
-        stats.total_api_response_time += kwargs.get('api_response_time', 0.0)
+        
+        # Armazena o tempo de resposta individual para cálculos de min/max/média
+        if (api_time := kwargs.get('api_response_time', 0.0)) > 0:
+            stats.api_response_times.append(api_time)
+            
         stats.total_retry_count += kwargs.get('retry_count', 0)
 
     async def record_request(self, batch_id: Optional[str] = None, **kwargs):
-        """
-        Registra os dados de uma única requisição finalizada.
-
-        Este é o principal método para alimentar dados no StatsManager.
-        Ele atualiza tanto as estatísticas globais quanto as do lote (se aplicável).
-        """
+        """Registra os dados de uma única requisição finalizada."""
         async with self._lock:
             await self._update_stats(self._global_stats, **kwargs)
             if batch_id and batch_id in self._batch_stats:
                 await self._update_stats(self._batch_stats[batch_id], **kwargs)
 
     async def record_rate_limiter_event(self, event: Dict[str, Any], batch_id: Optional[str] = None):
-        """
-        Registra eventos vindos do RateLimiter para manter as estatísticas precisas.
-        """
+        """Registra eventos vindos do RateLimiter."""
         event_type = event.get('event_type')
         async with self._lock:
             containers = [self._global_stats]
@@ -196,9 +160,6 @@ class StatsManager:
                 if event_type == 'proactive_pause':
                     stats.proactive_pauses += 1
                     stats.total_proactive_wait_time += event.get('wait_time', 0.0)
-                elif event_type == 'global_pause':
-                    stats.global_rate_limit_activations += 1
-                    stats.total_global_wait_time += event.get('wait_time', 0.0)
                 elif event_type == 'api_rate_limit_detected':
                      stats.api_rate_limits_detected += 1
                 elif event_type == 'concurrency_update':
@@ -207,11 +168,7 @@ class StatsManager:
     async def record_concurrent_start(self, batch_id: Optional[str] = None):
         """Registra o início de uma requisição para rastrear a concorrência."""
         async with self._lock:
-            containers = [self._global_stats]
-            if batch_id and batch_id in self._batch_stats:
-                containers.append(self._batch_stats[batch_id])
-            
-            for stats in containers:
+            for stats in self._get_relevant_containers(batch_id):
                 stats.current_concurrent_requests += 1
                 if stats.current_concurrent_requests > stats.concurrent_peak:
                     stats.concurrent_peak = stats.current_concurrent_requests
@@ -219,12 +176,15 @@ class StatsManager:
     async def record_concurrent_end(self, batch_id: Optional[str] = None):
         """Registra o fim de uma requisição."""
         async with self._lock:
-            containers = [self._global_stats]
-            if batch_id and batch_id in self._batch_stats:
-                containers.append(self._batch_stats[batch_id])
-            
-            for stats in containers:
+            for stats in self._get_relevant_containers(batch_id):
                 stats.current_concurrent_requests -= 1
+
+    def _get_relevant_containers(self, batch_id: Optional[str]) -> List[StatsContainer]:
+        """Retorna os contêineres de estatísticas relevantes (global e, se houver, de lote)."""
+        containers = [self._global_stats]
+        if batch_id and batch_id in self._batch_stats:
+            containers.append(self._batch_stats[batch_id])
+        return containers
 
     def start_batch(self, batch_id: str):
         """Inicia um novo contêiner de estatísticas para um lote."""
@@ -243,11 +203,9 @@ class StatsManager:
         return None
 
     def get_global_stats(self) -> StatsContainer:
-        """Retorna o contêiner de estatísticas globais."""
         return self._global_stats
 
     def get_batch_stats(self, batch_id: str) -> Optional[StatsContainer]:
-        """Retorna o contêiner de estatísticas de um lote específico."""
         return self._batch_stats.get(batch_id)
 
     def format_stats(self, stats: StatsContainer, title: str) -> str:
@@ -259,32 +217,30 @@ class StatsManager:
         
         # Seções
         summary = (
-            f"📊 RESUMO:\n"
-            f"   - Concluídas: {stats.total_requests} (✅ {stats.successful_requests} Sucesso | ❌ {stats.failed_requests} Falhas)\n"
-            f"   - Tempo Total: {stats.processing_time:.2f}s\n"
+            f"📊 RESUMO GERAL:\n"
+            f"   - Requisições Totais: {stats.total_requests} (✅ {stats.successful_requests} Sucesso | ❌ {stats.failed_requests} Falhas)\n"
+            f"   - Tempo Total do Lote: {stats.processing_time:.2f}s\n" # Correção 1
             f"   - Taxa de Sucesso: {stats.success_rate:.1f}%\n"
         )
         
         performance = (
-            f"⏱️ DESEMPENHO:\n"
-            f"   - Taxa Média: {stats.avg_rate:.2f} reqs/s\n"
-            f"   - Latência Média da API: {stats.avg_api_latency * 1000:.0f} ms/req\n"
-            f"   - Pico de Concorrência: {stats.concurrent_peak} requisições\n"
+            f"⏱️ DESEMPENHO E LATÊNCIA:\n"
+            f"   - Latência API (min/média/max): {stats.min_api_latency:.0f}ms / {stats.avg_api_latency:.0f}ms / {stats.max_api_latency:.0f}ms\n" # Correção 3
+            f"   - Pico de Concorrência Real: {stats.concurrent_peak} requisições\n" # Correção 2
+            f"   - Concorrência Configurada (alvo): {stats.configured_max_concurrency} requisições\n" # Correção 2
         )
 
         cost_consumption = (
-            f"💰 CUSTO E CONSUMO:\n"
-            f"   - Custo Total: ${stats.total_cost:.4f}\n"
-            f"   - Custo Médio por Req: ${stats.avg_cost_per_request:.6f}\n"
-            f"   - Total de Tokens: {stats.total_tokens:,} (In: {stats.total_input_tokens:,} | Out: {stats.total_output_tokens:,} | Cached: {stats.total_cached_tokens:,})\n"
+            f"💰 CUSTO E CONSUMO DE TOKENS:\n"
+            f"   - Custo Total Estimado: ${stats.total_cost:.4f}\n"
+            f"   - Total de Tokens: {stats.total_tokens:,} (Input: {stats.total_input_tokens:,} | Output: {stats.total_output_tokens:,} | Cache: {stats.total_cached_tokens:,})\n"
         )
 
         reliability = (
-            f"🛡️ CONFIABILIDADE E EFICIÊNCIA:\n"
+            f"🛡️ CONFIABILIDADE E EFICIÊNCIA DO RATE LIMITER:\n"
             f"   - Retries Totais: {stats.total_retry_count}\n"
             f"   - Erros de Rate Limit da API: {stats.api_rate_limits_detected}\n"
             f"   - Pausas Proativas: {stats.proactive_pauses} (totalizando {stats.total_proactive_wait_time:.2f}s)\n"
-            f"   - Pausas Forçadas por Erro: {stats.global_rate_limit_activations} (totalizando {stats.total_global_wait_time:.2f}s)\n"
         )
 
         if stats.failed_requests > 0:
@@ -296,3 +252,4 @@ class StatsManager:
         footer = "=" * 80
         
         return f"\n{header}\n\n{summary}\n{performance}\n{cost_consumption}\n{reliability}\n{footer}\n"
+
