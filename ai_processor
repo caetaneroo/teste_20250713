@@ -11,7 +11,7 @@ from typing import List, Dict, Any, Optional, Callable
 from tenacity import AsyncRetrying, RetryError, stop_after_attempt, wait_fixed
 from iaragenai import AsyncIaraGenAI  # Substitua pelo seu cliente de API real
 
-from rate_limiter import AdaptiveRateLimiter
+from rate_limiter import AdaptiveRateLimiter, INITIAL_CONCURRENCY
 from stats_manager import StatsManager
 
 logger = logging.getLogger(__name__)
@@ -68,8 +68,6 @@ class AIProcessor:
             async with self._lock:
                 self.completed_count += 1
                 progress_percent = (self.completed_count / self.total) * 100
-                
-                # Define os marcos de log (ex: a cada 10%)
                 current_milestone = int(progress_percent // 10) * 10
                 
                 if current_milestone > 0 and current_milestone not in self.logged_milestones:
@@ -81,11 +79,9 @@ class AIProcessor:
                     logger.info(
                         f"📊 Progresso do Lote '{self.batch_id}': {self.completed_count}/{self.total} ({progress_percent:.1f}%) | "
                         f"Taxa: {rate:.2f} reqs/s | ETA: {eta_seconds/60:.1f} min",
-                        extra={
-                            'action': 'batch_progress', 'batch_id': self.batch_id, 'completed': self.completed_count,
-                            'total': self.total, 'progress_percent': round(progress_percent, 1),
-                            'processing_rate': round(rate, 2), 'eta_minutes': round(eta_seconds / 60, 1)
-                        }
+                        extra={'action': 'batch_progress', 'batch_id': self.batch_id, 'completed': self.completed_count,
+                               'total': self.total, 'progress_percent': round(progress_percent, 1),
+                               'processing_rate': round(rate, 2), 'eta_minutes': round(eta_seconds / 60, 1)}
                     )
 
     def __init__(self, config: Dict[str, Any]):
@@ -102,12 +98,20 @@ class AIProcessor:
         self.temperature = config.get('temperature', 0.1)
         self.max_tokens = config.get('max_tokens')
         
-        self.stats_manager = StatsManager(models_config=self.models_config)
-        
+        # --- Sincronização da Configuração Inicial ---
         max_tpm = config.get('max_tpm', 125000)
+        initial_concurrency = config.get('initial_concurrency', INITIAL_CONCURRENCY)
+
+        self.stats_manager = StatsManager(
+            models_config=self.models_config,
+            max_tpm=max_tpm,
+            initial_concurrency=initial_concurrency
+        )
+        
         self.rate_limiter = AdaptiveRateLimiter(
             max_tpm=max_tpm,
-            stats_callback=self._create_stats_callback()
+            stats_callback=self._create_stats_callback(),
+            initial_concurrency=initial_concurrency
         )
 
         self.client = AsyncIaraGenAI(
@@ -118,32 +122,18 @@ class AIProcessor:
             correlation_id=config.get('correlation_id', 'ai-processor-final')
         )
         
-        logger.info(
-            "AIProcessor inicializado",
-            extra={
-                'action': 'ai_processor_init', 'model': self.model, 'max_tpm': max_tpm,
-                'json_schema_supported': self._supports_json_schema(self.model)
-            }
-        )
+        logger.info("AIProcessor inicializado",
+                    extra={'action': 'ai_processor_init', 'model': self.model, 'max_tpm': max_tpm,
+                           'json_schema_supported': self._supports_json_schema(self.model)})
 
     def _get_model_pricing(self, model: str) -> Dict[str, float]:
-        """Obtém os preços de um modelo a partir da configuração carregada."""
-        model_data = self.models_config.get(model)
-        if not model_data:
-            return {'input': 0.0, 'output': 0.0, 'cache': 0.0}
-        return {
-            'input': model_data.get('input', 0.0),
-            'output': model_data.get('output', 0.0),
-            'cache': model_data.get('cache', 0.0)
-        }
+        model_data = self.models_config.get(model, {})
+        return {'input': model_data.get('input', 0.0), 'output': model_data.get('output', 0.0), 'cache': model_data.get('cache', 0.0)}
 
     def _calculate_cost(self, input_tokens: int, output_tokens: int, cached_tokens: int = 0) -> float:
-        """Calcula o custo de uma requisição para inclusão no resultado final."""
         pricing = self._get_model_pricing(self.model)
         regular_input = max(0, input_tokens - cached_tokens)
-        return ((regular_input / 1000) * pricing['input'] +
-                (cached_tokens / 1000) * pricing['cache'] +
-                (output_tokens / 1000) * pricing['output'])
+        return ((regular_input / 1000) * pricing['input'] + (cached_tokens / 1000) * pricing['cache'] + (output_tokens / 1000) * pricing['output'])
 
     def _create_stats_callback(self) -> Callable:
         def callback(event: Dict[str, Any], batch_id: Optional[str] = None):
@@ -185,10 +175,8 @@ class AIProcessor:
             raise ValueError(f"custom_ids deve ter o mesmo tamanho que texts: {len(id_list)} != {total_items}")
         return [str(cid) if cid is not None else None for cid in id_list]
 
-    async def _make_api_call(
-        self, messages: List[Dict[str, str]], json_schema: Optional[Dict[str, Any]],
-        request_id: str, batch_id: Optional[str] = None
-    ) -> Dict[str, Any]:
+    async def _make_api_call(self, messages: List[Dict[str, str]], json_schema: Optional[Dict[str, Any]],
+                             request_id: str, batch_id: Optional[str] = None) -> Dict[str, Any]:
         self._validate_json_schema_compatibility(json_schema)
         await self.rate_limiter.await_permission_to_proceed()
         await self.stats_manager.record_concurrent_start(batch_id)
@@ -213,7 +201,6 @@ class AIProcessor:
                             try: parsed_content = json.loads(content)
                             except json.JSONDecodeError: pass
                         
-                        # Retorna um dicionário não ordenado; a ordenação é responsabilidade do chamador.
                         return {
                             'id': request_id, 'success': True, 'content': parsed_content,
                             'input_tokens': input_tokens, 'output_tokens': output_tokens,
@@ -249,43 +236,28 @@ class AIProcessor:
     
     def _create_ordered_result(self, result: Dict[str, Any], start_timestamp_iso: str) -> Dict[str, Any]:
         """Cria um dicionário de resultado final com a ordem de campos especificada."""
-        if result['success']:
+        if result.get('success'):
             return {
-                # --- Dados de Processamento ---
-                'id': result.get('id'),
-                'start_timestamp': start_timestamp_iso,
-                'success': result.get('success'),
-                'api_response_time': result.get('api_response_time'),
-                'attempts': result.get('attempts'),
-                # --- Dados de Tokens e Custo ---
-                'input_tokens': result.get('input_tokens'),
-                'output_tokens': result.get('output_tokens'),
-                'cached_tokens': result.get('cached_tokens'),
-                'total_tokens': result.get('total_tokens'),
-                'cost': result.get('cost'),
-                # --- Conteúdo ---
-                'raw_content': result.get('raw_content'),
-                'content': result.get('content'),
+                'id': result.get('id'), 'start_timestamp': start_timestamp_iso,
+                'success': result.get('success'), 'api_response_time': result.get('api_response_time'),
+                'attempts': result.get('attempts'), 'input_tokens': result.get('input_tokens'),
+                'output_tokens': result.get('output_tokens'), 'cached_tokens': result.get('cached_tokens'),
+                'total_tokens': result.get('total_tokens'), 'cost': result.get('cost'),
+                'raw_content': result.get('raw_content'), 'content': result.get('content'),
             }
         else:
-            # Estrutura para erros
             return {
-                'id': result.get('id'),
-                'start_timestamp': start_timestamp_iso,
-                'success': result.get('success'),
-                'error': result.get('error'),
+                'id': result.get('id'), 'start_timestamp': start_timestamp_iso,
+                'success': result.get('success'), 'error': result.get('error'),
                 'error_details': result.get('error_details'),
-                'api_response_time': result.get('api_response_time'),
-                'attempts': result.get('attempts'),
+                'api_response_time': result.get('api_response_time'), 'attempts': result.get('attempts'),
             }
             
-    async def process_single(
-        self, text: str, prompt_template: str, json_schema: Optional[Dict[str, Any]] = None,
-        custom_id: Optional[str] = None, **kwargs
-    ) -> Dict[str, Any]:
+    async def process_single(self, text: str, prompt_template: str, json_schema: Optional[Dict[str, Any]] = None,
+                             custom_id: Optional[str] = None, **kwargs) -> Dict[str, Any]:
         """Processa um único texto, retornando um resultado com estrutura ordenada."""
         start_time_ts = time.time()
-        start_timestamp_iso = datetime.fromtimestamp(start_time_ts, tz=timezone.utc).isoformat()
+        start_timestamp_iso = datetime.fromtimestamp(start_time_ts, tz=timezone.utc).astimezone(timezone(timedelta(hours=-3))).strftime('%Y-%m-%d %H:%M:%S')
         
         request_id = custom_id or f"req_{int(start_time_ts * 1000)}"
         prompt = prompt_template.format(text=text, **kwargs)
@@ -296,17 +268,15 @@ class AIProcessor:
         self.rate_limiter.record_request_completion(
             tokens_used=result.get('total_tokens', 0), success=result.get('success', False))
         
-        # O StatsManager recebe o resultado bruto, a ordem não importa para ele.
         await self.stats_manager.record_request(
             model=self.model, retry_count=max(0, result.get('attempts', 1) - 1), **result)
         
-        # Retorna o resultado formatado e ordenado para o usuário final.
         return self._create_ordered_result(result, start_timestamp_iso)
 
     async def _process_item_in_batch(self, item_data, prompt_template, json_schema, batch_id, progress_tracker, **kwargs):
         """Função worker que executa uma tarefa e retorna um resultado ordenado."""
         start_time_ts = time.time()
-        start_timestamp_iso = datetime.fromtimestamp(start_time_ts, tz=timezone.utc).isoformat()
+        start_timestamp_iso = datetime.fromtimestamp(start_time_ts, tz=timezone.utc).astimezone(timezone(timedelta(hours=-3))).strftime('%Y-%m-%d %H:%M:%S')
         result = {}
         try:
             index, text, custom_id = item_data
@@ -326,10 +296,8 @@ class AIProcessor:
         finally:
             await progress_tracker.increment_and_log()
 
-    async def process_batch(
-        self, texts: List[str], prompt_template: str, json_schema: Optional[Dict[str, Any]] = None,
-        batch_id: Optional[str] = None, custom_ids: Optional[Any] = None, **kwargs
-    ) -> Dict[str, Any]:
+    async def process_batch(self, texts: List[str], prompt_template: str, json_schema: Optional[Dict[str, Any]] = None,
+                            batch_id: Optional[str] = None, custom_ids: Optional[Any] = None, **kwargs) -> Dict[str, Any]:
         """Processa uma lista de textos em lote com logs de progresso e erros detalhados."""
         unique_timestamp = int(time.time())
         if batch_id:
@@ -367,8 +335,8 @@ class AIProcessor:
             'failed_requests': batch_stats.failed_requests,
             'total_requests': batch_stats.total_requests,
             'processing_time_seconds': round(batch_stats.processing_time, 2),
-            'start_time_iso': datetime.fromtimestamp(batch_stats.start_time, tz=timezone.utc).isoformat(),
-            'end_time_iso': datetime.fromtimestamp(batch_stats.end_time, tz=timezone.utc).isoformat(),
+            'start_time_iso': batch_stats.start_time_brt,
+            'end_time_iso': batch_stats.end_time_brt,
             'total_cost': round(batch_stats.total_cost, 4)
         }
         logger.info(
@@ -382,3 +350,4 @@ class AIProcessor:
     def get_stats_manager(self) -> StatsManager:
         """Retorna a instância do StatsManager para análise externa."""
         return self.stats_manager
+
