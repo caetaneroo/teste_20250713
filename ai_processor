@@ -45,149 +45,94 @@ class JSONSchemaNotSupportedError(Exception):
 class AIProcessor:
     """
     Orquestrador de chamadas para a API de IA, focado em alta eficiência e robustez.
-
-    Esta classe encapsula a lógica de interação com a API, delega o controle de
-    fluxo para o `AdaptiveRateLimiter` e o gerenciamento de métricas para o
-    `StatsManager`, resultando em um sistema modular e de alta performance.
     """
 
     def __init__(self, config: Dict[str, Any]):
         """
         Inicializa o processador de IA.
-
-        Args:
-            config (Dict[str, Any]): Dicionário de configuração contendo:
-                - client_id, client_secret: Credenciais da API.
-                - model: O modelo de IA a ser usado (e.g., 'gpt-4o-mini').
-                - max_tpm: (Opcional) Limite de Tokens Por Minuto. Padrão: 125000.
-                - Outros parâmetros opcionais como temperature, max_tokens, etc.
         """
-        # Carrega a configuração dos modelos, que será a fonte da verdade
         self.models_config = load_models_config()
         self.supported_models = set(self.models_config.keys())
         
-        # --- Configuração Essencial ---
         self.client_id = config['client_id']
         self.client_secret = config['client_secret']
         self.model = config.get('model', 'gpt-4o-mini')
 
         if self.model not in self.supported_models:
-            raise ValueError(
-                f"Modelo '{self.model}' não encontrado em models.json. "
-                f"Modelos suportados: {', '.join(sorted(self.supported_models))}"
-            )
+            raise ValueError(f"Modelo '{self.model}' não suportado. Modelos disponíveis: {', '.join(sorted(self.supported_models))}")
 
-        # --- Parâmetros da API ---
         self.temperature = config.get('temperature', 0.1)
         self.max_tokens = config.get('max_tokens')
         
-        # --- Inicialização dos Módulos de Suporte ---
         self.stats_manager = StatsManager(models_config=self.models_config)
         
-        # O RateLimiter recebe um callback para notificar o StatsManager sobre eventos
-        # Usa o default de 125000 para max_tpm se não for fornecido
         max_tpm = config.get('max_tpm', 125000)
         self.rate_limiter = AdaptiveRateLimiter(
             max_tpm=max_tpm,
             stats_callback=self._create_stats_callback()
         )
 
-        # --- Cliente da API ---
         self.client = AsyncIaraGenAI(
             client_id=self.client_id,
             client_secret=self.client_secret,
             environment=config.get('environment', 'dev'),
             provider=config.get('provider', 'azure_openai'),
-            correlation_id=config.get('correlation_id', 'ai-processor-v2')
+            correlation_id=config.get('correlation_id', 'ai-processor-v3')
         )
         
         logger.info(
-            "AIProcessor inicializado com sucesso",
+            "AIProcessor inicializado",
             extra={
-                'action': 'ai_processor_init',
-                'model': self.model,
-                'max_tpm': max_tpm,
+                'action': 'ai_processor_init', 'model': self.model, 'max_tpm': max_tpm,
                 'json_schema_supported': self._supports_json_schema(self.model)
             }
         )
 
     def _create_stats_callback(self) -> Callable:
-        """Cria uma função de callback para o RateLimiter se comunicar com o StatsManager."""
         def callback(event: Dict[str, Any], batch_id: Optional[str] = None):
             asyncio.create_task(self.stats_manager.record_rate_limiter_event(event, batch_id))
         return callback
 
     def _supports_json_schema(self, model: str) -> bool:
-        """Verifica se o modelo suporta json_schema, usando models.json como fonte."""
         return self.models_config.get(model, {}).get('json_schema', False)
 
     def _validate_json_schema_compatibility(self, json_schema: Optional[Dict[str, Any]]):
-        """Valida se o modelo atual suporta json_schema antes de prosseguir."""
         if json_schema and not self._supports_json_schema(self.model):
-            supported_models_str = ', '.join(
-                m for m, cfg in self.models_config.items() if cfg.get('json_schema')
-            )
-            raise JSONSchemaNotSupportedError(
-                f"O modelo '{self.model}' não suporta json_schema. "
-                f"Modelos compatíveis: {supported_models_str}. "
-                "Considere usar um modelo compatível ou remover o json_schema."
-            )
+            supported_models = [m for m, cfg in self.models_config.items() if cfg.get('json_schema')]
+            raise JSONSchemaNotSupportedError(f"Modelo '{self.model}' não suporta json_schema. Modelos compatíveis: {', '.join(supported_models)}")
 
     @staticmethod
     def _is_rate_limit_error(result: Dict[str, Any]) -> bool:
-        """Verifica se um resultado de erro é um erro de rate limit."""
-        if not isinstance(result, dict):
-            return False
+        if not isinstance(result, dict): return False
         error_msg = result.get('error', '').lower()
         return 'token rate limit' in error_msg or 'rate limit' in error_msg
 
     def _extract_wait_time_from_error(self, result: Dict[str, Any]) -> float:
-        """Extrai o tempo de espera de uma mensagem de erro de rate limit."""
         headers = result.get('response_headers', {})
         if 'retry-after' in headers:
-            try:
-                return float(headers['retry-after'])
-            except (ValueError, TypeError):
-                pass
-
+            try: return float(headers['retry-after'])
+            except (ValueError, TypeError): pass
         error_msg = result.get('error', '').lower()
         match = re.search(r'try again in.*?(\d+\.?\d*)\s*s', error_msg)
-        if match:
-            return float(match.group(1))
-        
+        if match: return float(match.group(1))
         return 60.0
 
     @staticmethod
     def _normalize_ids(ids: Any, total_items: int) -> Optional[List[str]]:
-        """Converte com segurança um objeto de IDs para uma lista de strings."""
-        if ids is None:
-            return None
-        
-        # Converte para lista se for um objeto tipo pandas Series/DataFrame
-        if hasattr(ids, 'tolist'):
-            id_list = ids.tolist()
-        elif hasattr(ids, 'values'):
-            id_list = list(ids.values)
-        elif not isinstance(ids, list):
-            id_list = list(ids)
-        else:
-            id_list = ids
-
+        if ids is None: return None
+        if hasattr(ids, 'tolist'): id_list = ids.tolist()
+        elif hasattr(ids, 'values'): id_list = list(ids.values)
+        elif not isinstance(ids, list): id_list = list(ids)
+        else: id_list = ids
         if len(id_list) != total_items:
             raise ValueError(f"custom_ids deve ter o mesmo tamanho que texts: {len(id_list)} != {total_items}")
-
         return [str(cid) if cid is not None else None for cid in id_list]
 
     async def _make_api_call(
-        self,
-        messages: List[Dict[str, str]],
-        json_schema: Optional[Dict[str, Any]],
-        request_id: str,
-        batch_id: Optional[str] = None
+        self, messages: List[Dict[str, str]], json_schema: Optional[Dict[str, Any]],
+        request_id: str, batch_id: Optional[str] = None
     ) -> Dict[str, Any]:
-        """Realiza a chamada à API, com retries e tratamento de erros."""
         self._validate_json_schema_compatibility(json_schema)
-        
         await self.rate_limiter.await_permission_to_proceed()
         await self.stats_manager.record_concurrent_start(batch_id)
         
@@ -196,31 +141,19 @@ class AIProcessor:
                 with attempt:
                     start_time = time.time()
                     try:
-                        api_params = {
-                            "model": self.model,
-                            "messages": messages,
-                            "temperature": self.temperature,
-                        }
-                        if self.max_tokens:
-                            api_params["max_tokens"] = self.max_tokens
-                        if json_schema:
-                            api_params["response_format"] = {"type": "json_object"}
-
+                        api_params = {"model": self.model, "messages": messages, "temperature": self.temperature}
+                        if self.max_tokens: api_params["max_tokens"] = self.max_tokens
+                        if json_schema: api_params["response_format"] = {"type": "json_object"}
                         response = await self.client.chat.completions.create(**api_params)
                         end_time = time.time()
-
                         content = response.choices[0].message.content
                         parsed_content = content
                         if json_schema and content:
-                            try:
-                                parsed_content = json.loads(content)
-                            except json.JSONDecodeError:
-                                pass
-                        
+                            try: parsed_content = json.loads(content)
+                            except json.JSONDecodeError: pass
                         return {
-                            'id': request_id, 'success': True, 'content': parsed_content,
-                            'raw_content': content, 'input_tokens': response.usage.prompt_tokens,
-                            'output_tokens': response.usage.completion_tokens,
+                            'id': request_id, 'success': True, 'content': parsed_content, 'raw_content': content,
+                            'input_tokens': response.usage.prompt_tokens, 'output_tokens': response.usage.completion_tokens,
                             'tokens_used': response.usage.total_tokens,
                             'cached_tokens': getattr(getattr(response.usage, 'prompt_tokens_details', {}), 'cached_tokens', 0),
                             'api_response_time': end_time - start_time, 'attempts': attempt.retry_state.attempt_number,
@@ -228,20 +161,17 @@ class AIProcessor:
                     except Exception as e:
                         end_time = time.time()
                         error_result = {
-                            'id': request_id, 'success': False, 'error': str(e),
-                            'error_type': type(e).__name__, 'api_response_time': end_time - start_time,
-                            'attempts': attempt.retry_state.attempt_number,
+                            'id': request_id, 'success': False, 'error': str(e), 'error_type': type(e).__name__,
+                            'api_response_time': end_time - start_time, 'attempts': attempt.retry_state.attempt_number,
                             'response_headers': dict(getattr(e, 'response', {}).headers or {}),
                         }
                         if self._is_rate_limit_error(error_result):
                             wait_time = self._extract_wait_time_from_error(error_result)
                             self.rate_limiter.record_api_rate_limit(wait_time)
-                            await self.stats_manager.record_rate_limiter_event({
-                                'event_type': 'api_rate_limit_detected', 'wait_time': wait_time
-                            }, batch_id)
+                            await self.stats_manager.record_rate_limiter_event(
+                                {'event_type': 'api_rate_limit_detected', 'wait_time': wait_time}, batch_id)
                             raise
                         return error_result
-
         except RetryError as retry_error:
             return {
                 'id': request_id, 'success': False,
@@ -252,97 +182,109 @@ class AIProcessor:
             await self.stats_manager.record_concurrent_end(batch_id)
     
     async def process_single(
-        self, text: str, prompt_template: str,
-        json_schema: Optional[Dict[str, Any]] = None,
+        self, text: str, prompt_template: str, json_schema: Optional[Dict[str, Any]] = None,
         custom_id: Optional[str] = None, **kwargs
     ) -> Dict[str, Any]:
-        """Processa um único texto."""
         request_id = custom_id or f"req_{int(time.time() * 1000)}"
         prompt = prompt_template.format(text=text, **kwargs)
         messages = [{"role": "user", "content": prompt}]
-        
         result = await self._make_api_call(messages, json_schema, request_id)
-
         self.rate_limiter.record_request_completion(
-            tokens_used=result.get('tokens_used', 0),
-            success=result.get('success', False)
-        )
-        
+            tokens_used=result.get('tokens_used', 0), success=result.get('success', False))
         await self.stats_manager.record_request(
-            model=self.model,
-            retry_count=max(0, result.get('attempts', 1) - 1),
-            **result
-        )
+            model=self.model, retry_count=max(0, result.get('attempts', 1) - 1), **result)
         return result
 
     async def _process_item_in_batch(self, item_data, prompt_template, json_schema, batch_id, **kwargs):
-        """Função worker para processar um item de um lote."""
         index, text, custom_id = item_data
         request_id = custom_id or f"{batch_id}_req_{index}"
-        
         prompt = prompt_template.format(text=text, **kwargs)
         messages = [{"role": "user", "content": prompt}]
-        
         result = await self._make_api_call(messages, json_schema, request_id, batch_id)
-
         self.rate_limiter.record_request_completion(
-            tokens_used=result.get('tokens_used', 0),
-            success=result.get('success', False)
-        )
-        
+            tokens_used=result.get('tokens_used', 0), success=result.get('success', False))
         await self.stats_manager.record_request(
-            batch_id=batch_id, model=self.model,
-            retry_count=max(0, result.get('attempts', 1) - 1),
-            **result
-        )
+            batch_id=batch_id, model=self.model, retry_count=max(0, result.get('attempts', 1) - 1), **result)
         return result
 
+    async def _progress_watcher(self, tasks: List[asyncio.Task], total: int, batch_id: str, start_time: float):
+        """Uma tarefa que monitora e loga o progresso de um lote."""
+        logged_milestones = set()
+        while True:
+            completed_count = sum(1 for task in tasks if task.done())
+            
+            # Loga em marcos de 10%
+            progress_percent = (completed_count / total) * 100
+            current_milestone = int(progress_percent // 10) * 10
+            
+            if current_milestone > 0 and current_milestone not in logged_milestones:
+                logged_milestones.add(current_milestone)
+                elapsed = time.time() - start_time
+                rate = completed_count / elapsed if elapsed > 0 else 0
+                eta_seconds = (total - completed_count) / rate if rate > 0 else 0
+                
+                logger.info(
+                    f"📊 Progresso do Lote '{batch_id}': {completed_count}/{total} ({progress_percent:.1f}%) | "
+                    f"Taxa: {rate:.2f} reqs/s | ETA: {eta_seconds/60:.1f} min",
+                    extra={
+                        'action': 'batch_progress', 'batch_id': batch_id, 'completed': completed_count,
+                        'total': total, 'progress_percent': round(progress_percent, 1),
+                        'processing_rate': round(rate, 2), 'eta_minutes': round(eta_seconds / 60, 1)
+                    }
+                )
+
+            if completed_count == total:
+                break # Todas as tarefas terminaram, o watcher pode parar
+                
+            await asyncio.sleep(2) # Verifica o progresso a cada 2 segundos
+
     async def process_batch(
-        self, texts: List[str], prompt_template: str,
-        json_schema: Optional[Dict[str, Any]] = None,
-        batch_id: Optional[str] = None,
-        custom_ids: Optional[List[str]] = None, **kwargs
+        self, texts: List[str], prompt_template: str, json_schema: Optional[Dict[str, Any]] = None,
+        batch_id: Optional[str] = None, custom_ids: Optional[Any] = None, **kwargs
     ) -> Dict[str, Any]:
-        """Processa uma lista de textos em lote com alta concorrência e eficiência."""
+        """Processa uma lista de textos em lote com alta concorrência, eficiência e logs de progresso."""
         batch_id = batch_id or f"batch_{int(time.time())}"
         self.stats_manager.start_batch(batch_id)
 
-        # Normaliza e valida os IDs customizados
         normalized_ids = self._normalize_ids(custom_ids, len(texts))
         
         logger.info(
             f"🚀 Iniciando processamento em lote '{batch_id}' com {len(texts)} itens.",
             extra={'action': 'batch_start', 'batch_id': batch_id, 'total_items': len(texts)}
         )
-
+        
+        start_time = time.time()
         items_to_process = [
             (i, texts[i], normalized_ids[i] if normalized_ids else None)
             for i in range(len(texts))
         ]
 
-        tasks = [
+        worker_tasks = [
             asyncio.create_task(self._process_item_in_batch(item, prompt_template, json_schema, batch_id, **kwargs))
             for item in items_to_process
         ]
         
-        results = await asyncio.gather(*tasks)
+        # Inicia a tarefa de monitoramento de progresso
+        progress_task = asyncio.create_task(self._progress_watcher(worker_tasks, len(texts), batch_id, start_time))
+
+        # Aguarda a conclusão de todas as tarefas de processamento
+        results = await asyncio.gather(*worker_tasks)
         
+        # Cancela o watcher para garantir que ele termine
+        progress_task.cancel()
+        try:
+            await progress_task
+        except asyncio.CancelledError:
+            pass # A exceção de cancelamento é esperada e normal
+
         batch_stats = self.stats_manager.end_batch(batch_id)
         
         logger.info(
-            f"✅ Lote '{batch_id}' concluído. "
-            f"Sucesso: {batch_stats.successful_requests}, Falhas: {batch_stats.failed_requests}.",
-            extra={
-                'action': 'batch_complete', 'batch_id': batch_id,
-                **batch_stats.__dict__
-            }
+            f"✅ Lote '{batch_id}' concluído. Sucesso: {batch_stats.successful_requests}, Falhas: {batch_stats.failed_requests}.",
+            extra={'action': 'batch_complete', 'batch_id': batch_id, **vars(batch_stats)}
         )
         
-        return {
-            'results': results,
-            'batch_stats': batch_stats,
-            'batch_id': batch_id
-        }
+        return {'results': results, 'batch_stats': batch_stats, 'batch_id': batch_id}
 
     def get_stats_manager(self) -> StatsManager:
         """Retorna a instância do StatsManager para análise externa."""
