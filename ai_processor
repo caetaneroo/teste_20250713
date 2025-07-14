@@ -1,264 +1,371 @@
 import asyncio
 import time
+import json
 import logging
-from collections import deque
-from typing import Deque, Tuple, Callable, Dict, Any
+import re
+import os
+from typing import List, Dict, Any, Optional, Callable
 
-# Configura o logger para este módulo
+from tenacity import AsyncRetrying, RetryError, stop_after_attempt, wait_fixed
+from iaragenai import AsyncIaraGenAI  # Substitua pelo seu cliente de API real
+
+from .rate_limiter import AdaptiveRateLimiter
+from .stats_manager import StatsManager
+
 logger = logging.getLogger(__name__)
 
-# --- Constantes de Configuração para o Rate Limiter Dinâmico ---
+# --- Constantes de Configuração ---
+MAX_RETRY = 3  # Aumentado para 3 para dar mais uma chance em caso de falhas transitórias
 
-# Período da janela deslizante para cálculo de TPM (Tokens Por Minuto)
-WINDOW_SECONDS = 60.0
-
-# Número de requisições recentes a serem usadas para calcular o custo médio
-REQUEST_COST_HISTORY_SIZE = 50
-
-# Custo em tokens a ser assumido para a primeira requisição, antes de termos dados reais
-DEFAULT_PREDICTED_COST = 1000
-
-# Limites para o ajuste dinâmico de concorrência
-INITIAL_CONCURRENCY = 2
-MIN_CONCURRENCY = 1
-MAX_CONCURRENCY = 50 # Um limite superior seguro para evitar sobrecarga
-
-# Frequência com que a concorrência é aumentada (após N requisições bem-sucedidas)
-CONCURRENCY_ADJUSTMENT_THRESHOLD = 20
-
-
-class AdaptiveRateLimiter:
+def load_models_config(config_path: str = "models.json") -> Dict[str, Any]:
     """
-    Controla o fluxo de requisições à API de forma dinâmica e preditiva.
+    Carrega a configuração dos modelos a partir de um arquivo JSON.
+    Este arquivo é a única fonte da verdade para modelos, preços e capacidades.
+    """
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Arquivo de configuração '{config_path}' não encontrado. Este arquivo é obrigatório.")
+    
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            models_config = json.load(f)
+        
+        if not models_config or not isinstance(models_config, dict):
+            raise ValueError(f"Arquivo '{config_path}' está vazio ou não é um dicionário JSON válido.")
+        
+        return models_config
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Erro ao decodificar JSON em '{config_path}': {e}")
+    except Exception as e:
+        raise RuntimeError(f"Erro inesperado ao carregar '{config_path}': {e}")
 
-    Esta classe gerencia o throughput para operar próximo ao limite máximo de
-    Tokens Por Minuto (TPM) sem excedê-lo. Ela utiliza uma abordagem reativa
-    e preditiva em vez de estimativas prévias.
+class JSONSchemaNotSupportedError(Exception):
+    """Exceção levantada quando json_schema é usado com um modelo incompatível."""
+    pass
 
-    Estratégias principais:
-    1.  **Orçamento de Tokens (Token Budget):** Mantém um registro do consumo de
-        tokens em uma janela deslizante de 60 segundos.
-    2.  **Pausas Proativas:** Antes de permitir uma nova requisição, prevê seu custo
-        com base na média das últimas chamadas reais. Se o "orçamento" de tokens
-        for insuficiente, pausa a execução proativamente pelo tempo necessário.
-    3.  **Concorrência Dinâmica:** Ajusta automaticamente o número de requisições
-        paralelas (concorrência). Começa de forma conservadora, aumenta quando o
-        sistema está estável e reduz agressivamente ao detectar erros,
-        especialmente de rate limit.
-    4.  **Desacoplamento de Stats:** Não armazena estatísticas de longo prazo. Em vez
-        disso, utiliza um `stats_callback` para notificar um gerenciador externo
-        (como o StatsManager) sobre eventos importantes (pausas, erros, etc.).
+class AIProcessor:
+    """
+    Orquestrador de chamadas para a API de IA, focado em alta eficiência e robustez.
+
+    Esta classe encapsula a lógica de interação com a API, delega o controle de
+    fluxo para o `AdaptiveRateLimiter` e o gerenciamento de métricas para o
+    `StatsManager`, resultando em um sistema modular e de alta performance.
     """
 
-    def __init__(
-        self,
-        max_tpm: int,
-        stats_callback: Callable[[Dict[str, Any]], None],
-    ):
+    def __init__(self, config: Dict[str, Any]):
         """
-        Inicializa o Rate Limiter dinâmico.
+        Inicializa o processador de IA.
 
         Args:
-            max_tpm (int): O limite máximo de tokens por minuto permitido pela API.
-            stats_callback (Callable): Função a ser chamada para registrar eventos
-                                      de estatísticas. Essencial para desacoplar a
-                                      lógica de controle da lógica de stats.
+            config (Dict[str, Any]): Dicionário de configuração contendo:
+                - client_id, client_secret: Credenciais da API.
+                - model: O modelo de IA a ser usado (e.g., 'gpt-4o-mini').
+                - max_tpm: Limite de Tokens Por Minuto.
+                - Outros parâmetros opcionais como temperature, max_tokens, etc.
         """
-        if max_tpm <= 0:
-            raise ValueError("max_tpm deve ser um valor positivo.")
+        # Carrega a configuração dos modelos, que será a fonte da verdade
+        self.models_config = load_models_config()
+        self.supported_models = set(self.models_config.keys())
         
-        self.max_tpm = max_tpm
-        self._stats_callback = stats_callback
-        self._lock = asyncio.Lock()
+        # --- Configuração Essencial ---
+        self.client_id = config['client_id']
+        self.client_secret = config['client_secret']
+        self.model = config.get('model', 'gpt-4o-mini')
 
-        # Estruturas de dados para controle de fluxo
-        self.token_usage_window: Deque[Tuple[float, int]] = deque()
-        self.tokens_in_window: int = 0
-        self.recent_request_costs: Deque[int] = deque(maxlen=REQUEST_COST_HISTORY_SIZE)
+        if self.model not in self.supported_models:
+            raise ValueError(
+                f"Modelo '{self.model}' não encontrado em models.json. "
+                f"Modelos suportados: {', '.join(sorted(self.supported_models))}"
+            )
+
+        # --- Parâmetros da API ---
+        self.temperature = config.get('temperature', 0.1)
+        self.max_tokens = config.get('max_tokens')
         
-        # Estado do controle dinâmico
-        self._avg_request_cost: float = DEFAULT_PREDICTED_COST
-        self._global_pause_until: float = 0.0
-        self.dynamic_concurrency = INITIAL_CONCURRENCY
-        self._successful_reqs_since_adjustment: int = 0
-
-        # O semáforo que controla a concorrência. É recriado quando a concorrência muda.
-        self._semaphore = asyncio.Semaphore(self.dynamic_concurrency)
-
-        logger.info(
-            "AdaptiveRateLimiter inicializado com estratégia de controle dinâmico",
-            extra={
-                'action': 'rate_limiter_init',
-                'strategy': 'dynamic_concurrency_token_budget',
-                'max_tpm': self.max_tpm,
-                'initial_concurrency': self.dynamic_concurrency,
-            },
+        # --- Inicialização dos Módulos de Suporte ---
+        self.stats_manager = StatsManager(models_config=self.models_config)
+        
+        # O RateLimiter recebe um callback para notificar o StatsManager sobre eventos
+        self.rate_limiter = AdaptiveRateLimiter(
+            max_tpm=config['max_tpm'],
+            stats_callback=self._create_stats_callback()
         )
 
-    def _prune_usage_window(self) -> None:
-        """Remove registros de tokens da janela que são mais antigos que WINDOW_SECONDS."""
-        now = time.time()
-        while self.token_usage_window and (now - self.token_usage_window[0][0] > WINDOW_SECONDS):
-            _timestamp, tokens = self.token_usage_window.popleft()
-            self.tokens_in_window -= tokens
-
-    def _update_semaphore(self):
-        """Recria o semáforo com o novo valor de concorrência."""
-        # Esta é a forma segura de ajustar a capacidade de um semáforo em asyncio.
-        new_semaphore = asyncio.Semaphore(self.dynamic_concurrency)
+        # --- Cliente da API ---
+        self.client = AsyncIaraGenAI(
+            client_id=self.client_id,
+            client_secret=self.client_secret,
+            environment=config.get('environment', 'dev'),
+            provider=config.get('provider', 'azure_openai'),
+            correlation_id=config.get('correlation_id', 'ai-processor-v2')
+        )
+        
         logger.info(
-            f"Nível de concorrência ajustado para {self.dynamic_concurrency}",
+            "AIProcessor inicializado com sucesso",
             extra={
-                'action': 'concurrency_adjusted',
-                'new_concurrency': self.dynamic_concurrency,
-                'current_tpm_rate': self.tokens_in_window
+                'action': 'ai_processor_init',
+                'model': self.model,
+                'max_tpm': config['max_tpm'],
+                'json_schema_supported': self._supports_json_schema(self.model)
             }
         )
-        # Notifica o StatsManager sobre a mudança
-        self._stats_callback({
-            'event_type': 'concurrency_update',
-            'new_concurrency': self.dynamic_concurrency
-        })
-        self._semaphore = new_semaphore
 
-    async def _adjust_concurrency(self, is_success: bool = False, is_rate_limit_error: bool = False):
-        """Ajusta o nível de concorrência com base no resultado da última requisição."""
-        current_concurrency = self.dynamic_concurrency
+    def _create_stats_callback(self) -> Callable:
+        """Cria uma função de callback para o RateLimiter se comunicar com o StatsManager."""
+        def callback(event: Dict[str, Any], batch_id: Optional[str] = None):
+            # Envia o evento para o StatsManager em uma nova tarefa para não bloquear o RateLimiter
+            asyncio.create_task(self.stats_manager.record_rate_limiter_event(event, batch_id))
+        return callback
 
-        if is_rate_limit_error:
-            # Reação agressiva a um rate limit: reduzir pela metade ou para o mínimo.
-            self.dynamic_concurrency = max(MIN_CONCURRENCY, int(self.dynamic_concurrency / 2))
-            self._successful_reqs_since_adjustment = 0 # Reseta o contador para subir devagar
-        elif is_success:
-            self._successful_reqs_since_adjustment += 1
-            # Aumenta a concorrência gradualmente se o sistema estiver estável
-            if self._successful_reqs_since_adjustment >= CONCURRENCY_ADJUSTMENT_THRESHOLD:
-                self.dynamic_concurrency = min(MAX_CONCURRENCY, self.dynamic_concurrency + 1)
-                self._successful_reqs_since_adjustment = 0
-        else: # Falha genérica (não rate limit)
-            # Redução moderada para falhas não relacionadas a rate limit.
-            self.dynamic_concurrency = max(MIN_CONCURRENCY, self.dynamic_concurrency - 1)
-            self._successful_reqs_since_adjustment = 0
+    def _supports_json_schema(self, model: str) -> bool:
+        """Verifica se o modelo suporta json_schema, usando models.json como fonte."""
+        return self.models_config.get(model, {}).get('json_schema', False)
 
-        if current_concurrency != self.dynamic_concurrency:
-            self._update_semaphore()
-
-    async def await_permission_to_proceed(self) -> None:
-        """
-        Ponto de entrada principal. Aguarda a permissão para executar uma nova requisição.
-
-        Este método garante que tanto o limite de concorrência quanto o de TPM
-        sejam respeitados, pausando a execução se necessário.
-        """
-        # 1. Respeita o limite de concorrência dinâmico
-        await self._semaphore.acquire()
-
-        async with self._lock:
-            # 2. Verifica se há uma pausa global forçada por um erro de rate limit
-            now = time.time()
-            if now < self._global_pause_until:
-                wait_time = self._global_pause_until - now
-                logger.warning(
-                    f"Pausa global ativa. Aguardando {wait_time:.2f}s devido a erro de rate limit anterior.",
-                    extra={'action': 'global_pause_enforced', 'wait_time': wait_time}
-                )
-                self._stats_callback({
-                    'event_type': 'global_pause',
-                    'wait_time': wait_time,
-                    'reason': 'API rate limit error'
-                })
-                await asyncio.sleep(wait_time)
-
-            # 3. Executa a pausa proativa baseada no orçamento de tokens
-            self._prune_usage_window()
-            predicted_cost = self._avg_request_cost
-            available_tpm = self.max_tpm - self.tokens_in_window
-
-            if predicted_cost > available_tpm:
-                # Calcula quanto tempo esperar para que tokens mais antigos "saiam" da janela
-                wait_time = (self.token_usage_window[0][0] + WINDOW_SECONDS) - time.time()
-                wait_time = max(wait_time, 0.1) # Garante uma espera mínima para evitar loops apertados
-                
-                logger.info(
-                    f"Pausa proativa para evitar rate limit. "
-                    f"Previsto: {predicted_cost:.0f} > Disponível: {available_tpm:.0f}. "
-                    f"Aguardando {wait_time:.2f}s.",
-                    extra={
-                        'action': 'proactive_pause',
-                        'wait_time': wait_time,
-                        'predicted_cost': predicted_cost,
-                        'available_tpm': available_tpm
-                    }
-                )
-                self._stats_callback({
-                    'event_type': 'proactive_pause',
-                    'wait_time': wait_time,
-                    'reason': 'Insufficient token budget'
-                })
-                await asyncio.sleep(wait_time)
-
-    def record_request_completion(self, tokens_used: int, success: bool):
-        """
-        Registra o resultado de uma requisição para atualizar o estado do limiter.
-
-        Args:
-            tokens_used (int): O número real de tokens consumidos pela requisição.
-            success (bool): Se a requisição foi bem-sucedida.
-        """
-        try:
-            # Libera o semáforo para a próxima tarefa poder prosseguir.
-            self._semaphore.release()
-        except ValueError:
-            # Isso pode acontecer se o semáforo for recriado. É seguro ignorar.
-            pass
-
-        asyncio.create_task(self._async_record_request(tokens_used, success))
-
-    async def _async_record_request(self, tokens_used: int, success: bool):
-        """Processa o registro de forma assíncrona para não bloquear o chamador."""
-        async with self._lock:
-            if success and tokens_used > 0:
-                now = time.time()
-                # Atualiza o consumo na janela de tempo
-                self.token_usage_window.append((now, tokens_used))
-                self.tokens_in_window += tokens_used
-
-                # Atualiza a média de custo para predições futuras
-                self.recent_request_costs.append(tokens_used)
-                self._avg_request_cost = sum(self.recent_request_costs) / len(self.recent_request_costs)
-            
-            # Ajusta a concorrência com base no sucesso ou falha
-            await self._adjust_concurrency(is_success=success)
-
-    def record_api_rate_limit(self, wait_time: float):
-        """
-        Ativa o "freio de emergência" quando um erro de rate limit da API é detectado.
-
-        Args:
-            wait_time (float): O tempo de espera sugerido pela API.
-        """
-        try:
-            self._semaphore.release()
-        except ValueError:
-            pass
-        
-        asyncio.create_task(self._async_record_rate_limit(wait_time))
-
-    async def _async_record_rate_limit(self, wait_time: float):
-        """Processa o registro de rate limit de forma assíncrona."""
-        async with self._lock:
-            # Define um tempo de pausa global para todas as próximas requisições
-            self._global_pause_until = time.time() + wait_time
-            
-            # Reduz drasticamente a concorrência como medida de segurança
-            await self._adjust_concurrency(is_rate_limit_error=True)
-            
-            logger.error(
-                f"RATE LIMIT DA API DETECTADO! Ativando pausa global por {wait_time:.2f}s "
-                f"e reduzindo concorrência para {self.dynamic_concurrency}.",
-                extra={
-                    'action': 'api_rate_limit_detected',
-                    'wait_time': wait_time,
-                    'new_concurrency': self.dynamic_concurrency
-                }
+    def _validate_json_schema_compatibility(self, json_schema: Optional[Dict[str, Any]]):
+        """Valida se o modelo atual suporta json_schema antes de prosseguir."""
+        if json_schema and not self._supports_json_schema(self.model):
+            supported_models_str = ', '.join(
+                m for m, cfg in self.models_config.items() if cfg.get('json_schema')
             )
+            raise JSONSchemaNotSupportedError(
+                f"O modelo '{self.model}' não suporta json_schema. "
+                f"Modelos compatíveis: {supported_models_str}. "
+                "Considere usar um modelo compatível ou remover o json_schema."
+            )
+    
+    @staticmethod
+    def _is_rate_limit_error(result: Dict[str, Any]) -> bool:
+        """Verifica se um resultado de erro é um erro de rate limit."""
+        if not isinstance(result, dict):
+            return False
+        error_msg = result.get('error', '').lower()
+        return 'token rate limit' in error_msg or 'rate limit' in error_msg
+
+    def _extract_wait_time_from_error(self, result: Dict[str, Any]) -> float:
+        """Extrai o tempo de espera de uma mensagem de erro de rate limit."""
+        # Prioriza o header 'retry-after', que geralmente é mais confiável
+        headers = result.get('response_headers', {})
+        if 'retry-after' in headers:
+            try:
+                return float(headers['retry-after'])
+            except (ValueError, TypeError):
+                pass
+
+        error_msg = result.get('error', '').lower()
+        match = re.search(r'try again in.*?(\d+\.?\d*)\s*s', error_msg)
+        if match:
+            return float(match.group(1))
+
+        # Fallback para um valor padrão seguro
+        return 60.0
+
+    async def _make_api_call(
+        self,
+        messages: List[Dict[str, str]],
+        json_schema: Optional[Dict[str, Any]],
+        request_id: str,
+        batch_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Realiza a chamada à API, com retries e tratamento de erros.
+        Este é o coração da interação com a API.
+        """
+        self._validate_json_schema_compatibility(json_schema)
+        
+        # Delega ao RateLimiter a decisão de quando prosseguir
+        await self.rate_limiter.await_permission_to_proceed()
+
+        await self.stats_manager.record_concurrent_start(batch_id)
+        
+        try:
+            async for attempt in AsyncRetrying(stop=stop_after_attempt(MAX_RETRY), wait=wait_fixed(1), reraise=True):
+                with attempt:
+                    start_time = time.time()
+                    try:
+                        api_params = {
+                            "model": self.model,
+                            "messages": messages,
+                            "temperature": self.temperature,
+                        }
+                        if self.max_tokens:
+                            api_params["max_tokens"] = self.max_tokens
+                        if json_schema:
+                            api_params["response_format"] = {"type": "json_object"} # Assume modo JSON
+
+                        response = await self.client.chat.completions.create(**api_params)
+                        end_time = time.time()
+
+                        # Parse do conteúdo
+                        content = response.choices[0].message.content
+                        parsed_content = content
+                        if json_schema and content:
+                            try:
+                                parsed_content = json.loads(content)
+                            except json.JSONDecodeError:
+                                # A resposta não foi um JSON válido, mas a chamada foi um sucesso
+                                # A lógica de validação do resultado deve tratar isso
+                                pass
+                        
+                        return {
+                            'id': request_id,
+                            'success': True,
+                            'content': parsed_content,
+                            'raw_content': content,
+                            'input_tokens': response.usage.prompt_tokens,
+                            'output_tokens': response.usage.completion_tokens,
+                            'tokens_used': response.usage.total_tokens,
+                            'cached_tokens': getattr(getattr(response.usage, 'prompt_tokens_details', {}), 'cached_tokens', 0),
+                            'api_response_time': end_time - start_time,
+                            'attempts': attempt.retry_state.attempt_number,
+                        }
+
+                    except Exception as e:
+                        end_time = time.time()
+                        error_result = {
+                            'id': request_id,
+                            'success': False,
+                            'error': str(e),
+                            'error_type': type(e).__name__,
+                            'api_response_time': end_time - start_time,
+                            'attempts': attempt.retry_state.attempt_number,
+                            'response_headers': dict(getattr(e, 'response', {}).headers or {}),
+                        }
+                        # Se for um erro de rate limit, notifica o limiter e levanta a exceção
+                        # para o tenacity tentar novamente após a pausa.
+                        if self._is_rate_limit_error(error_result):
+                            wait_time = self._extract_wait_time_from_error(error_result)
+                            self.rate_limiter.record_api_rate_limit(wait_time)
+                            # Notifica o StatsManager
+                            await self.stats_manager.record_rate_limiter_event({
+                                'event_type': 'api_rate_limit_detected',
+                                'wait_time': wait_time
+                            }, batch_id)
+                            raise  # Força o retry do Tenacity, que aguardará o wait_fixed
+                        
+                        # Para outros erros, retorna o resultado imediatamente sem retry
+                        return error_result
+
+        except RetryError as retry_error:
+            # Ocorre se todas as tentativas falharem
+            return {
+                'id': request_id,
+                'success': False,
+                'error': f'Máximo de {MAX_RETRY} tentativas excedido. Último erro: {retry_error.last_attempt.exception()}',
+                'error_type': 'RetryError',
+                'attempts': MAX_RETRY,
+            }
+        finally:
+            await self.stats_manager.record_concurrent_end(batch_id)
+    
+    async def process_single(
+        self,
+        text: str,
+        prompt_template: str,
+        json_schema: Optional[Dict[str, Any]] = None,
+        custom_id: Optional[str] = None,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """Processa um único texto."""
+        request_id = custom_id or f"req_{int(time.time() * 1000)}"
+        prompt = prompt_template.format(text=text, **kwargs)
+        messages = [{"role": "user", "content": prompt}]
+        
+        result = await self._make_api_call(messages, json_schema, request_id)
+
+        # Informa o RateLimiter sobre o resultado para ajuste dinâmico
+        self.rate_limiter.record_request_completion(
+            tokens_used=result.get('tokens_used', 0),
+            success=result.get('success', False)
+        )
+        
+        # Registra os dados completos no StatsManager
+        await self.stats_manager.record_request(
+            model=self.model,
+            retry_count=max(0, result.get('attempts', 1) - 1),
+            **result
+        )
+        
+        return result
+
+    async def _process_item_in_batch(self, item_data, prompt_template, json_schema, batch_id, **kwargs):
+        """Função worker para processar um item de um lote."""
+        index, text, custom_id = item_data
+        request_id = custom_id or f"{batch_id}_req_{index}"
+        
+        prompt = prompt_template.format(text=text, **kwargs)
+        messages = [{"role": "user", "content": prompt}]
+        
+        result = await self._make_api_call(messages, json_schema, request_id, batch_id)
+
+        self.rate_limiter.record_request_completion(
+            tokens_used=result.get('tokens_used', 0),
+            success=result.get('success', False)
+        )
+        
+        await self.stats_manager.record_request(
+            batch_id=batch_id,
+            model=self.model,
+            retry_count=max(0, result.get('attempts', 1) - 1),
+            **result
+        )
+
+        return result
+
+    async def process_batch(
+        self,
+        texts: List[str],
+        prompt_template: str,
+        json_schema: Optional[Dict[str, Any]] = None,
+        batch_id: Optional[str] = None,
+        custom_ids: Optional[List[str]] = None,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """
+        Processa uma lista de textos em lote com alta concorrência e eficiência.
+        """
+        batch_id = batch_id or f"batch_{int(time.time())}"
+        self.stats_manager.start_batch(batch_id)
+
+        if custom_ids and len(custom_ids) != len(texts):
+            raise ValueError("custom_ids deve ter o mesmo tamanho que texts.")
+        
+        logger.info(
+            f"🚀 Iniciando processamento em lote '{batch_id}' com {len(texts)} itens.",
+            extra={'action': 'batch_start', 'batch_id': batch_id, 'total_items': len(texts)}
+        )
+
+        # Prepara os dados para cada tarefa
+        items_to_process = [
+            (i, texts[i], custom_ids[i] if custom_ids else None)
+            for i in range(len(texts))
+        ]
+
+        # Cria e executa todas as tarefas concorrentemente
+        tasks = [
+            asyncio.create_task(self._process_item_in_batch(item, prompt_template, json_schema, batch_id, **kwargs))
+            for item in items_to_process
+        ]
+        
+        # Aguarda a conclusão de todas as tarefas
+        results = await asyncio.gather(*tasks)
+        
+        batch_stats = self.stats_manager.end_batch(batch_id)
+        
+        logger.info(
+            f"✅ Lote '{batch_id}' concluído. "
+            f"Sucesso: {batch_stats.successful_requests}, Falhas: {batch_stats.failed_requests}.",
+            extra={
+                'action': 'batch_complete',
+                'batch_id': batch_id,
+                **batch_stats.__dict__ # Loga todas as estatísticas do lote
+            }
+        )
+        
+        return {
+            'results': results,
+            'batch_stats': batch_stats,
+            'batch_id': batch_id
+        }
+
+    def get_stats_manager(self) -> StatsManager:
+        """Retorna a instância do StatsManager para análise externa."""
+        return self.stats_manager
