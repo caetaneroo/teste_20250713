@@ -8,32 +8,28 @@ from typing import Deque, Tuple, Callable, Dict, Any
 logger = logging.getLogger(__name__)
 
 # --- Constantes de Configuração para o Rate Limiter Dinâmico ---
-
-# Período da janela deslizante para cálculo de TPM (Tokens Por Minuto)
 WINDOW_SECONDS = 60.0
-
-# Número de requisições recentes a serem usadas para calcular o custo médio
 REQUEST_COST_HISTORY_SIZE = 50
+DEFAULT_PREDICTED_COST = 1500 # Um valor inicial conservador
 
-# Custo em tokens a ser assumido para a primeira requisição, antes de termos dados reais
-DEFAULT_PREDICTED_COST = 1000
+# --- Configurações de Concorrência ---
+INITIAL_CONCURRENCY = 10
+MIN_CONCURRENCY = 2
+MAX_CONCURRENCY = 75 # Limite superior seguro e realista
 
-# Limites para o ajuste dinâmico de concorrência
-INITIAL_CONCURRENCY = 10  # Aumentado conforme solicitado
-MIN_CONCURRENCY = 1
-MAX_CONCURRENCY = 50 # Um limite superior seguro para evitar sobrecarga
-
-# Frequência com que a concorrência é avaliada para ajuste (após N requisições)
-CONCURRENCY_ADJUSTMENT_THRESHOLD = 10 # Reduzido para ajustes mais frequentes
+# --- Configurações do Algoritmo de Ajuste ---
+# Frequência com que a concorrência é avaliada para ajuste
+CONCURRENCY_ADJUSTMENT_THRESHOLD = 10
+# Após as primeiras N requisições, faz o primeiro salto agressivo
+INITIAL_RAMP_UP_THRESHOLD = 10
+# Fator de segurança: operar a 90% da capacidade máxima de TPM
+TPM_TARGET_FACTOR = 0.90
 
 
 class AdaptiveRateLimiter:
     """
-    Controla o fluxo de requisições à API de forma dinâmica e preditiva.
-
-    Esta classe gerencia o throughput para operar próximo ao limite máximo de
-    Tokens Por Minuto (TPM) sem excedê-lo. Ela utiliza uma abordagem reativa
-    e preditiva em vez de estimativas prévias.
+    Controla o fluxo de requisições à API com uma estratégia de concorrência
+    dinâmica e agressiva para maximizar o throughput.
     """
 
     def __init__(
@@ -41,9 +37,6 @@ class AdaptiveRateLimiter:
         max_tpm: int,
         stats_callback: Callable[[Dict[str, Any]], None],
     ):
-        """
-        Inicializa o Rate Limiter dinâmico.
-        """
         if max_tpm <= 0:
             raise ValueError("max_tpm deve ser um valor positivo.")
         
@@ -60,16 +53,15 @@ class AdaptiveRateLimiter:
         self._avg_request_cost: float = DEFAULT_PREDICTED_COST
         self._global_pause_until: float = 0.0
         self.dynamic_concurrency = INITIAL_CONCURRENCY
-        self._successful_reqs_since_adjustment: int = 0
+        self._reqs_since_adjustment: int = 0
 
-        # O semáforo que controla a concorrência. É recriado quando a concorrência muda.
         self._semaphore = asyncio.Semaphore(self.dynamic_concurrency)
+        self._is_adjusting = False # Flag para evitar ajustes concorrentes
 
         logger.info(
-            "AdaptiveRateLimiter inicializado com estratégia de controle dinâmico",
+            "AdaptiveRateLimiter inicializado com estratégia AIMD agressiva",
             extra={
                 'action': 'rate_limiter_init',
-                'strategy': 'dynamic_concurrency_token_budget',
                 'max_tpm': self.max_tpm,
                 'initial_concurrency': self.dynamic_concurrency,
             },
@@ -82,111 +74,98 @@ class AdaptiveRateLimiter:
             _timestamp, tokens = self.token_usage_window.popleft()
             self.tokens_in_window -= tokens
 
-    def _update_semaphore(self):
-        """Recria o semáforo com o novo valor de concorrência."""
-        self._semaphore = asyncio.Semaphore(self.dynamic_concurrency)
-        logger.info(
-            f"Nível de concorrência ajustado para {self.dynamic_concurrency}",
-            extra={
-                'action': 'concurrency_adjusted',
-                'new_concurrency': self.dynamic_concurrency,
-                'current_tpm_rate': self.tokens_in_window
-            }
-        )
-        self._stats_callback({
-            'event_type': 'concurrency_update',
-            'new_concurrency': self.dynamic_concurrency
-        })
+    def _update_concurrency(self, new_concurrency: int):
+        """Atualiza o valor da concorrência e recria o semáforo de forma segura."""
+        new_concurrency = max(MIN_CONCURRENCY, min(MAX_CONCURRENCY, new_concurrency))
+        
+        if new_concurrency != self.dynamic_concurrency:
+            self.dynamic_concurrency = new_concurrency
+            self._semaphore = asyncio.Semaphore(self.dynamic_concurrency)
+            logger.info(
+                f"Nível de concorrência ajustado para {self.dynamic_concurrency}",
+                extra={'action': 'concurrency_adjusted', 'new_concurrency': self.dynamic_concurrency}
+            )
+            self._stats_callback({
+                'event_type': 'concurrency_update',
+                'new_concurrency': self.dynamic_concurrency
+            })
 
-    async def _adjust_concurrency(self, is_success: bool = False, is_rate_limit_error: bool = False):
-        """Ajusta o nível de concorrência de forma inteligente e agressiva."""
-        current_concurrency = self.dynamic_concurrency
+    async def _adjust_concurrency(self, is_rate_limit_error: bool = False):
+        """Ajusta a concorrência usando uma estratégia AIMD agressiva."""
+        if self._is_adjusting:
+            return
+        
+        self._is_adjusting = True
+        try:
+            if is_rate_limit_error:
+                # Multiplicative Decrease: Reduz drasticamente em caso de erro.
+                new_concurrency = max(MIN_CONCURRENCY, int(self.dynamic_concurrency / 2))
+                self._update_concurrency(new_concurrency)
+                self._reqs_since_adjustment = 0
+                return
 
-        if is_rate_limit_error:
-            # Reação agressiva a um rate limit: reduzir pela metade ou para o mínimo.
-            self.dynamic_concurrency = max(MIN_CONCURRENCY, int(self.dynamic_concurrency / 2))
-            self._successful_reqs_since_adjustment = 0 # Reseta o contador
-        elif is_success:
-            self._successful_reqs_since_adjustment += 1
-            # A cada N requisições, reavalia a concorrência ideal
-            if self._successful_reqs_since_adjustment >= CONCURRENCY_ADJUSTMENT_THRESHOLD:
-                if self._avg_request_cost > 0:
-                    # Calcula a concorrência máxima teórica para não exceder o TPM
-                    # Este é um cálculo aproximado que assume que as requisições duram menos de um minuto
-                    # e que o custo é o principal fator limitante.
-                    # Ex: 125.000 TPM / 1000 tokens/req = 125 reqs por minuto. 
-                    # A concorrência ideal depende da duração de cada request. 
-                    # Usamos um fator de segurança para não ser excessivamente agressivo.
-                    # O cálculo mais simples é limitar o número de requests por minuto.
-                    # Se um request leva 2s, um "worker" faz 30/minuto.
-                    # Vamos usar um cálculo mais direto e empírico.
-                    tpm_per_request_per_minute = self._avg_request_cost # Assumindo que a duração é < 1 min
-                    
-                    # Target é 85% do TPM para ter margem de segurança.
-                    target_tpm = self.max_tpm * 0.85
-                    # Concorrência ideal = target_tpm / (tpm por request)
-                    max_possible_concurrency = int(target_tpm / tpm_per_request_per_minute)
-                    
-                    # Garante que o valor está dentro dos limites seguros
-                    max_possible_concurrency = max(MIN_CONCURRENCY, min(MAX_CONCURRENCY, max_possible_concurrency))
-                    
-                    # Move a concorrência em direção ao valor ideal
-                    if self.dynamic_concurrency < max_possible_concurrency:
-                        self.dynamic_concurrency = min(self.dynamic_concurrency + 2, max_possible_concurrency)
-                    elif self.dynamic_concurrency > max_possible_concurrency:
-                        self.dynamic_concurrency = max(max_possible_concurrency, self.dynamic_concurrency - 2)
-                else: # Se não temos custo médio, aumenta conservadoramente
-                    self.dynamic_concurrency = min(self.dynamic_concurrency + 1, MAX_CONCURRENCY)
+            # Additive Increase (de forma inteligente)
+            self._reqs_since_adjustment += 1
+            
+            # Condição para reavaliar a concorrência
+            should_adjust = (
+                self._reqs_since_adjustment >= INITIAL_RAMP_UP_THRESHOLD and
+                self._reqs_since_adjustment % CONCURRENCY_ADJUSTMENT_THRESHOLD == 0
+            )
+
+            if should_adjust and self._avg_request_cost > 0:
+                # Calcula a concorrência ideal para atingir 90% do TPM
+                target_tpm = self.max_tpm * TPM_TARGET_FACTOR
+                # Ideal: quantas requisições de custo médio cabem no nosso alvo de TPM
+                ideal_concurrency = int(target_tpm / self._avg_request_cost)
                 
-                self._successful_reqs_since_adjustment = 0
-        else: # Falha genérica (não rate limit)
-            # Redução moderada para falhas não relacionadas a rate limit.
-            self.dynamic_concurrency = max(MIN_CONCURRENCY, self.dynamic_concurrency - 1)
-            self._successful_reqs_since_adjustment = 0
-
-        if current_concurrency != self.dynamic_concurrency:
-            self._update_semaphore()
+                # Para o primeiro ajuste, salta diretamente para o valor ideal
+                if self._reqs_since_adjustment == INITIAL_RAMP_UP_THRESHOLD:
+                    logger.info(f"Rampa inicial: saltando para concorrência ideal de ~{ideal_concurrency}")
+                    self._update_concurrency(ideal_concurrency)
+                else: # Para ajustes subsequentes, move-se em direção ao ideal
+                    self._update_concurrency(ideal_concurrency)
+        finally:
+            self._is_adjusting = False
 
     async def await_permission_to_proceed(self) -> None:
-        """Ponto de entrada que aguarda permissão para executar, respeitando concorrência e TPM."""
+        """Aguarda permissão para executar, respeitando concorrência e TPM."""
         await self._semaphore.acquire()
 
         async with self._lock:
-            # Verifica se há uma pausa global forçada por um erro de rate limit
+            # Pausa global forçada por erro de rate limit
             now = time.time()
             if now < self._global_pause_until:
                 wait_time = self._global_pause_until - now
                 await asyncio.sleep(wait_time)
 
-            # Executa a pausa proativa baseada no orçamento de tokens
+            # Pausa proativa para evitar ultrapassar o limite de TPM
             self._prune_usage_window()
             predicted_cost = self._avg_request_cost
             available_tpm = self.max_tpm - self.tokens_in_window
 
-            # **CORREÇÃO ANTI-STALL**: Só tenta pausar se tiver registros na janela de tempo
             if predicted_cost > available_tpm and self.token_usage_window:
-                # Calcula o tempo necessário para que o token mais antigo saia da janela
-                wait_time = (self.token_usage_window[0][0] + WINDOW_SECONDS) - time.time()
-                wait_time = max(wait_time, 0.1) # Espera mínima para evitar loops
+                wait_time = (self.token_usage_window[0][0] + WINDOW_SECONDS) - time.time() + 0.1
+                wait_time = max(wait_time, 0.1)
                 
-                logger.info(
-                    f"Pausa proativa para evitar rate limit. Aguardando {wait_time:.2f}s.",
-                    extra={'action': 'proactive_pause', 'wait_time': wait_time}
-                )
+                logger.info(f"Pausa proativa de {wait_time:.2f}s para evitar rate limit.")
                 self._stats_callback({'event_type': 'proactive_pause', 'wait_time': wait_time})
                 await asyncio.sleep(wait_time)
 
     def record_request_completion(self, tokens_used: int, success: bool):
-        """Registra o resultado de uma requisição para atualizar o estado do limiter."""
+        """Registra o resultado e libera o semáforo imediatamente."""
         try:
             self._semaphore.release()
         except ValueError:
-            # Pode acontecer se o semáforo for recriado enquanto uma tarefa libera. Seguro ignorar.
+            # Seguro ignorar, pode acontecer durante o ajuste de concorrência.
             pass
-        asyncio.create_task(self._async_record_request(tokens_used, success))
+        
+        # Agenda o processamento do resultado em segundo plano
+        asyncio.create_task(self._async_process_result(tokens_used, success))
 
-    async def _async_record_request(self, tokens_used: int, success: bool):
-        """Processa o registro de forma assíncrona para não bloquear o chamador."""
+    async def _async_process_result(self, tokens_used: int, success: bool):
+        """Processa o resultado, atualiza métricas e ajusta a concorrência."""
+        # Segura o lock apenas para atualizar dados compartilhados
         async with self._lock:
             if success and tokens_used > 0:
                 now = time.time()
@@ -195,23 +174,27 @@ class AdaptiveRateLimiter:
 
                 self.recent_request_costs.append(tokens_used)
                 self._avg_request_cost = sum(self.recent_request_costs) / len(self.recent_request_costs)
-            
-            await self._adjust_concurrency(is_success=success)
+        
+        # O ajuste de concorrência é chamado fora do lock principal
+        await self._adjust_concurrency()
 
     def record_api_rate_limit(self, wait_time: float):
-        """Ativa o "freio de emergência" quando um erro de rate limit da API é detectado."""
+        """Ativa o freio de emergência ao detectar um erro de rate limit da API."""
         try:
             self._semaphore.release()
         except ValueError:
             pass
-        asyncio.create_task(self._async_record_rate_limit(wait_time))
+        
+        asyncio.create_task(self._async_handle_rate_limit_error(wait_time))
 
-    async def _async_record_rate_limit(self, wait_time: float):
-        """Processa o registro de rate limit de forma assíncrona."""
+    async def _async_handle_rate_limit_error(self, wait_time: float):
+        """Processa o erro de rate limit: pausa global e reduz concorrência."""
         async with self._lock:
             self._global_pause_until = time.time() + wait_time
-            await self._adjust_concurrency(is_rate_limit_error=True)
-            logger.error(
-                f"RATE LIMIT DA API DETECTADO! Pausa global por {wait_time:.2f}s, concorrência reduzida para {self.dynamic_concurrency}.",
-                extra={'action': 'api_rate_limit_detected', 'wait_time': wait_time}
-            )
+        
+        await self._adjust_concurrency(is_rate_limit_error=True)
+        
+        logger.error(
+            f"RATE LIMIT DA API DETECTADO! Pausa global por {wait_time:.2f}s. Concorrência reduzida para {self.dynamic_concurrency}.",
+            extra={'action': 'api_rate_limit_detected', 'wait_time': wait_time}
+        )
