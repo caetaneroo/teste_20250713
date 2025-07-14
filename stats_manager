@@ -19,7 +19,6 @@ class StatsContainer:
     id: str
     start_time: float = field(default_factory=time.time)
     end_time: Optional[float] = None
-    initial_concurrency: int = 0
 
     # --- Contadores de Requisição ---
     total_requests: int = 0
@@ -40,18 +39,13 @@ class StatsContainer:
     # --- Rastreamento de Concorrência ---
     current_concurrent_requests: int = 0
     concurrent_peak: int = 0
-    configured_max_concurrency: int = field(init=False)
 
     # --- Métricas de Rate Limiter ---
     api_rate_limits_detected: int = 0
     proactive_pauses: int = 0
     total_proactive_wait_time: float = 0.0
     peak_tpm: int = 0
-
-    def __post_init__(self):
-        # Garante que a concorrência configurada seja inicializada corretamente.
-        self.configured_max_concurrency = self.initial_concurrency
-
+    
     # --- Propriedades Calculadas ---
     @property
     def processing_time(self) -> float:
@@ -91,6 +85,13 @@ class StatsContainer:
     def avg_api_latency(self) -> float:
         return statistics.mean(self.api_response_times) if self.api_response_times else 0
 
+    @property
+    def requests_per_second(self) -> float:
+        """Calcula a taxa de requisições por segundo (throughput)."""
+        if self.processing_time > 0:
+            return self.total_requests / self.processing_time
+        return 0.0
+
     # --- Propriedades para Timestamps Formatados ---
     @staticmethod
     def _format_brt(timestamp: float) -> str:
@@ -117,11 +118,10 @@ class StatsManager:
     com uma interface simplificada e robusta para o usuário.
     """
 
-    def __init__(self, models_config: Dict[str, Any], max_tpm: int, initial_concurrency: int):
+    def __init__(self, models_config: Dict[str, Any], max_tpm: int):
         self._models_config = models_config
         self.max_tpm = max_tpm
-        self.initial_concurrency = initial_concurrency
-        self._global_stats = StatsContainer(id="global", initial_concurrency=initial_concurrency)
+        self._global_stats = StatsContainer(id="global")
         self._batch_stats: Dict[str, StatsContainer] = {}
         self._lock = asyncio.Lock()
         self._last_batch_id: Optional[str] = None
@@ -168,9 +168,7 @@ class StatsManager:
                     stats.total_proactive_wait_time += event.get('wait_time', 0.0)
                 elif event_type == 'api_rate_limit_detected':
                      stats.api_rate_limits_detected += 1
-                elif event_type == 'concurrency_update':
-                    stats.configured_max_concurrency = event.get('new_concurrency', 0)
-                elif event_type == 'token_usage_update': # CORREÇÃO: Nome do evento correto
+                elif event_type == 'token_usage_update':
                     current_tpm = event.get('current_tpm', 0)
                     if current_tpm > stats.peak_tpm:
                         stats.peak_tpm = current_tpm
@@ -197,8 +195,7 @@ class StatsManager:
         if batch_id in self._batch_stats:
             logger.warning(f"Batch com ID '{batch_id}' já existe. Sobrescrevendo estatísticas.")
         self._last_batch_id = batch_id
-        # CORREÇÃO: Garante que o contêiner do lote seja inicializado com a concorrência correta
-        self._batch_stats[batch_id] = StatsContainer(id=batch_id, initial_concurrency=self.initial_concurrency)
+        self._batch_stats[batch_id] = StatsContainer(id=batch_id)
         logger.info(f"Lote de estatísticas '{batch_id}' iniciado.")
 
     def end_batch(self, batch_id: str) -> Optional[StatsContainer]:
@@ -228,13 +225,13 @@ class StatsManager:
             f"🚀 EFICIÊNCIA DA PARALELIZAÇÃO:\n"
             f"   - Tempo Total de API (Serial): {stats.total_api_time:.2f}s\n"
             f"   - Ganho com Paralelização: {stats.parallelization_gain_seconds:.2f}s ({stats.parallelization_gain_percent:.1f}% de economia de tempo)\n"
+            f"   - Vazão (Throughput): {stats.requests_per_second:.2f} reqs/s\n"
         )
 
         tpm_usage_percent = (stats.peak_tpm / self.max_tpm * 100) if self.max_tpm > 0 else 0
         performance = (
             f"⏱️ DESEMPENHO E LATÊNCIA:\n"
             f"   - Latência API (min/média/max): {stats.min_api_latency:.1f}s / {stats.avg_api_latency:.1f}s / {stats.max_api_latency:.1f}s\n"
-            f"   - Concorrência Configurada (Alvo): {stats.configured_max_concurrency} requisições\n"
             f"   - Pico de Concorrência (Real): {stats.concurrent_peak} requisições\n"
             f"   - Pico de Consumo TPM: {stats.peak_tpm:,} / {self.max_tpm:,} ({tpm_usage_percent:.1f}% do limite)\n"
         )
@@ -271,3 +268,4 @@ class StatsManager:
             title = "GLOBAL"
         
         return self._format_stats(stats_obj, title)
+
