@@ -34,7 +34,7 @@ class AdaptiveRateLimiter:
         self,
         max_tpm: int,
         stats_callback: Callable[[Dict[str, Any]], None],
-        initial_concurrency: int = INITIAL_CONCURRENCY
+        initial_concurrency: int = INITIAL_CONCURRENCY  # **CORREÇÃO**: Parâmetro adicionado
     ):
         if max_tpm <= 0:
             raise ValueError("max_tpm deve ser um valor positivo.")
@@ -46,7 +46,7 @@ class AdaptiveRateLimiter:
         # --- Estado do Controle de Fluxo ---
         self.token_usage_window: Deque[Tuple[float, int]] = deque()
         self.tokens_in_window: int = 0
-        self.recent_request_costs: Deque[int] = deque(maxlen=REQUEST_COST_HISTORY_SIZE)
+        self.recent_request_costs: Deque[int]] = deque(maxlen=REQUEST_COST_HISTORY_SIZE)
         self._avg_request_cost: float = DEFAULT_PREDICTED_COST
         
         # --- Estado do Controle de Concorrência ---
@@ -161,3 +161,4 @@ class AdaptiveRateLimiter:
             extra={'action': 'api_rate_limit_detected', 'wait_time': wait_time}
         )
         await self._adjust_concurrency_strategy(is_rate_limit_error=True)
+
