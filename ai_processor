@@ -4,7 +4,8 @@ import json
 import logging
 import re
 import os
-import traceback  # Importado para capturar tracebacks completos
+import traceback
+from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Callable
 
 from tenacity import AsyncRetrying, RetryError, stop_after_attempt, wait_fixed
@@ -68,8 +69,8 @@ class AIProcessor:
                 self.completed_count += 1
                 progress_percent = (self.completed_count / self.total) * 100
                 
-                # Define os marcos de log (ex: a cada 5%)
-                current_milestone = int(progress_percent // 5) * 5
+                # Define os marcos de log (ex: a cada 10%)
+                current_milestone = int(progress_percent // 10) * 10
                 
                 if current_milestone > 0 and current_milestone not in self.logged_milestones:
                     self.logged_milestones.add(current_milestone)
@@ -114,7 +115,7 @@ class AIProcessor:
             client_secret=self.client_secret,
             environment=config.get('environment', 'dev'),
             provider=config.get('provider', 'azure_openai'),
-            correlation_id=config.get('correlation_id', 'ai-processor-v4')
+            correlation_id=config.get('correlation_id', 'ai-processor-final')
         )
         
         logger.info(
@@ -124,6 +125,25 @@ class AIProcessor:
                 'json_schema_supported': self._supports_json_schema(self.model)
             }
         )
+
+    def _get_model_pricing(self, model: str) -> Dict[str, float]:
+        """Obtém os preços de um modelo a partir da configuração carregada."""
+        model_data = self.models_config.get(model)
+        if not model_data:
+            return {'input': 0.0, 'output': 0.0, 'cache': 0.0}
+        return {
+            'input': model_data.get('input', 0.0),
+            'output': model_data.get('output', 0.0),
+            'cache': model_data.get('cache', 0.0)
+        }
+
+    def _calculate_cost(self, input_tokens: int, output_tokens: int, cached_tokens: int = 0) -> float:
+        """Calcula o custo de uma requisição para inclusão no resultado final."""
+        pricing = self._get_model_pricing(self.model)
+        regular_input = max(0, input_tokens - cached_tokens)
+        return ((regular_input / 1000) * pricing['input'] +
+                (cached_tokens / 1000) * pricing['cache'] +
+                (output_tokens / 1000) * pricing['output'])
 
     def _create_stats_callback(self) -> Callable:
         def callback(event: Dict[str, Any], batch_id: Optional[str] = None):
@@ -182,18 +202,25 @@ class AIProcessor:
                         if self.max_tokens: api_params["max_tokens"] = self.max_tokens
                         if json_schema: api_params["response_format"] = {"type": "json_object"}
                         response = await self.client.chat.completions.create(**api_params)
-                        end_time = time.time()
+                        
+                        # Estrutura a resposta de sucesso com os campos desejados
+                        input_tokens = response.usage.prompt_tokens
+                        output_tokens = response.usage.completion_tokens
+                        cached_tokens = getattr(getattr(response.usage, 'prompt_tokens_details', {}), 'cached_tokens', 0)
+                        
                         content = response.choices[0].message.content
                         parsed_content = content
                         if json_schema and content:
                             try: parsed_content = json.loads(content)
                             except json.JSONDecodeError: pass
+                        
                         return {
-                            'id': request_id, 'success': True, 'content': parsed_content, 'raw_content': content,
-                            'input_tokens': response.usage.prompt_tokens, 'output_tokens': response.usage.completion_tokens,
-                            'tokens_used': response.usage.total_tokens,
-                            'cached_tokens': getattr(getattr(response.usage, 'prompt_tokens_details', {}), 'cached_tokens', 0),
-                            'api_response_time': end_time - start_time, 'attempts': attempt.retry_state.attempt_number,
+                            'id': request_id, 'success': True, 'content': parsed_content,
+                            'input_tokens': input_tokens, 'output_tokens': output_tokens,
+                            'cached_tokens': cached_tokens, 'total_tokens': response.usage.total_tokens,
+                            'cost': self._calculate_cost(input_tokens, output_tokens, cached_tokens),
+                            'api_response_time': time.time() - start_time, 'attempts': attempt.retry_state.attempt_number,
+                            'raw_content': content
                         }
                     except Exception as e:
                         error_details = {'type': type(e).__name__, 'message': str(e), 'traceback': traceback.format_exc()}
@@ -224,31 +251,47 @@ class AIProcessor:
         self, text: str, prompt_template: str, json_schema: Optional[Dict[str, Any]] = None,
         custom_id: Optional[str] = None, **kwargs
     ) -> Dict[str, Any]:
-        request_id = custom_id or f"req_{int(time.time() * 1000)}"
+        """Processa um único texto, enriquecendo o resultado com timestamp."""
+        start_time_ts = time.time()
+        start_timestamp_iso = datetime.fromtimestamp(start_time_ts, tz=timezone.utc).isoformat()
+        
+        request_id = custom_id or f"req_{int(start_time_ts * 1000)}"
         prompt = prompt_template.format(text=text, **kwargs)
         messages = [{"role": "user", "content": prompt}]
+        
         result = await self._make_api_call(messages, json_schema, request_id)
+        result['start_timestamp'] = start_timestamp_iso # Adiciona o timestamp ao resultado final
+        
         self.rate_limiter.record_request_completion(
-            tokens_used=result.get('tokens_used', 0), success=result.get('success', False))
+            tokens_used=result.get('total_tokens', 0), success=result.get('success', False))
+        
         await self.stats_manager.record_request(
             model=self.model, retry_count=max(0, result.get('attempts', 1) - 1), **result)
+        
         return result
 
     async def _process_item_in_batch(self, item_data, prompt_template, json_schema, batch_id, progress_tracker, **kwargs):
         """Função worker que executa uma tarefa e notifica o rastreador de progresso ao final."""
+        start_time_ts = time.time()
+        start_timestamp_iso = datetime.fromtimestamp(start_time_ts, tz=timezone.utc).isoformat()
+        result = {}
         try:
             index, text, custom_id = item_data
             request_id = custom_id or f"{batch_id}_req_{index}"
             prompt = prompt_template.format(text=text, **kwargs)
             messages = [{"role": "user", "content": prompt}]
+            
             result = await self._make_api_call(messages, json_schema, request_id, batch_id)
+            result['start_timestamp'] = start_timestamp_iso
+            
             self.rate_limiter.record_request_completion(
-                tokens_used=result.get('tokens_used', 0), success=result.get('success', False))
+                tokens_used=result.get('total_tokens', 0), success=result.get('success', False))
+            
             await self.stats_manager.record_request(
                 batch_id=batch_id, model=self.model, retry_count=max(0, result.get('attempts', 1) - 1), **result)
+            
             return result
         finally:
-            # Garante que o progresso seja incrementado mesmo se ocorrer um erro inesperado
             await progress_tracker.increment_and_log()
 
     async def process_batch(
@@ -256,9 +299,14 @@ class AIProcessor:
         batch_id: Optional[str] = None, custom_ids: Optional[Any] = None, **kwargs
     ) -> Dict[str, Any]:
         """Processa uma lista de textos em lote com logs de progresso e erros detalhados."""
-        batch_id = batch_id or f"batch_{int(time.time())}"
-        self.stats_manager.start_batch(batch_id)
+        # Garante que o batch_id seja sempre único
+        unique_timestamp = int(time.time())
+        if batch_id:
+            batch_id = f"{batch_id}_{unique_timestamp}"
+        else:
+            batch_id = f"batch_{unique_timestamp}"
 
+        self.stats_manager.start_batch(batch_id)
         normalized_ids = self._normalize_ids(custom_ids, len(texts))
         
         logger.info(
@@ -282,9 +330,21 @@ class AIProcessor:
         
         batch_stats = self.stats_manager.end_batch(batch_id)
         
+        # Estrutura os dados do log final para maior clareza
+        log_extra = {
+            'action': 'batch_complete', 'batch_id': batch_id,
+            'successful_requests': batch_stats.successful_requests,
+            'failed_requests': batch_stats.failed_requests,
+            'total_requests': batch_stats.total_requests,
+            'processing_time_seconds': round(batch_stats.processing_time, 2),
+            'start_time_iso': datetime.fromtimestamp(batch_stats.start_time, tz=timezone.utc).isoformat(),
+            'end_time_iso': datetime.fromtimestamp(batch_stats.end_time, tz=timezone.utc).isoformat(),
+            'total_cost': round(batch_stats.total_cost, 4)
+        }
         logger.info(
-            f"✅ Lote '{batch_id}' concluído. Sucesso: {batch_stats.successful_requests}, Falhas: {batch_stats.failed_requests}.",
-            extra={'action': 'batch_complete', 'batch_id': batch_id, **vars(batch_stats)}
+            f"✅ Lote '{batch_id}' concluído em {log_extra['processing_time_seconds']:.2f}s. "
+            f"Sucesso: {batch_stats.successful_requests}, Falhas: {batch_stats.failed_requests}.",
+            extra=log_extra
         )
         
         return {'results': results, 'batch_stats': batch_stats, 'batch_id': batch_id}
@@ -292,4 +352,3 @@ class AIProcessor:
     def get_stats_manager(self) -> StatsManager:
         """Retorna a instância do StatsManager para análise externa."""
         return self.stats_manager
-
