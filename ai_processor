@@ -9,13 +9,13 @@ from typing import List, Dict, Any, Optional, Callable
 from tenacity import AsyncRetrying, RetryError, stop_after_attempt, wait_fixed
 from iaragenai import AsyncIaraGenAI  # Substitua pelo seu cliente de API real
 
-from .rate_limiter import AdaptiveRateLimiter
-from .stats_manager import StatsManager
+from rate_limiter import AdaptiveRateLimiter
+from stats_manager import StatsManager
 
 logger = logging.getLogger(__name__)
 
 # --- Constantes de Configuração ---
-MAX_RETRY = 3  # Aumentado para 3 para dar mais uma chance em caso de falhas transitórias
+MAX_RETRY = 3
 
 def load_models_config(config_path: str = "models.json") -> Dict[str, Any]:
     """
@@ -59,7 +59,7 @@ class AIProcessor:
             config (Dict[str, Any]): Dicionário de configuração contendo:
                 - client_id, client_secret: Credenciais da API.
                 - model: O modelo de IA a ser usado (e.g., 'gpt-4o-mini').
-                - max_tpm: Limite de Tokens Por Minuto.
+                - max_tpm: (Opcional) Limite de Tokens Por Minuto. Padrão: 125000.
                 - Outros parâmetros opcionais como temperature, max_tokens, etc.
         """
         # Carrega a configuração dos modelos, que será a fonte da verdade
@@ -85,8 +85,10 @@ class AIProcessor:
         self.stats_manager = StatsManager(models_config=self.models_config)
         
         # O RateLimiter recebe um callback para notificar o StatsManager sobre eventos
+        # Usa o default de 125000 para max_tpm se não for fornecido
+        max_tpm = config.get('max_tpm', 125000)
         self.rate_limiter = AdaptiveRateLimiter(
-            max_tpm=config['max_tpm'],
+            max_tpm=max_tpm,
             stats_callback=self._create_stats_callback()
         )
 
@@ -104,7 +106,7 @@ class AIProcessor:
             extra={
                 'action': 'ai_processor_init',
                 'model': self.model,
-                'max_tpm': config['max_tpm'],
+                'max_tpm': max_tpm,
                 'json_schema_supported': self._supports_json_schema(self.model)
             }
         )
@@ -112,7 +114,6 @@ class AIProcessor:
     def _create_stats_callback(self) -> Callable:
         """Cria uma função de callback para o RateLimiter se comunicar com o StatsManager."""
         def callback(event: Dict[str, Any], batch_id: Optional[str] = None):
-            # Envia o evento para o StatsManager em uma nova tarefa para não bloquear o RateLimiter
             asyncio.create_task(self.stats_manager.record_rate_limiter_event(event, batch_id))
         return callback
 
@@ -131,7 +132,7 @@ class AIProcessor:
                 f"Modelos compatíveis: {supported_models_str}. "
                 "Considere usar um modelo compatível ou remover o json_schema."
             )
-    
+
     @staticmethod
     def _is_rate_limit_error(result: Dict[str, Any]) -> bool:
         """Verifica se um resultado de erro é um erro de rate limit."""
@@ -142,7 +143,6 @@ class AIProcessor:
 
     def _extract_wait_time_from_error(self, result: Dict[str, Any]) -> float:
         """Extrai o tempo de espera de uma mensagem de erro de rate limit."""
-        # Prioriza o header 'retry-after', que geralmente é mais confiável
         headers = result.get('response_headers', {})
         if 'retry-after' in headers:
             try:
@@ -154,9 +154,29 @@ class AIProcessor:
         match = re.search(r'try again in.*?(\d+\.?\d*)\s*s', error_msg)
         if match:
             return float(match.group(1))
-
-        # Fallback para um valor padrão seguro
+        
         return 60.0
+
+    @staticmethod
+    def _normalize_ids(ids: Any, total_items: int) -> Optional[List[str]]:
+        """Converte com segurança um objeto de IDs para uma lista de strings."""
+        if ids is None:
+            return None
+        
+        # Converte para lista se for um objeto tipo pandas Series/DataFrame
+        if hasattr(ids, 'tolist'):
+            id_list = ids.tolist()
+        elif hasattr(ids, 'values'):
+            id_list = list(ids.values)
+        elif not isinstance(ids, list):
+            id_list = list(ids)
+        else:
+            id_list = ids
+
+        if len(id_list) != total_items:
+            raise ValueError(f"custom_ids deve ter o mesmo tamanho que texts: {len(id_list)} != {total_items}")
+
+        return [str(cid) if cid is not None else None for cid in id_list]
 
     async def _make_api_call(
         self,
@@ -165,15 +185,10 @@ class AIProcessor:
         request_id: str,
         batch_id: Optional[str] = None
     ) -> Dict[str, Any]:
-        """
-        Realiza a chamada à API, com retries e tratamento de erros.
-        Este é o coração da interação com a API.
-        """
+        """Realiza a chamada à API, com retries e tratamento de erros."""
         self._validate_json_schema_compatibility(json_schema)
         
-        # Delega ao RateLimiter a decisão de quando prosseguir
         await self.rate_limiter.await_permission_to_proceed()
-
         await self.stats_manager.record_concurrent_start(batch_id)
         
         try:
@@ -189,80 +204,57 @@ class AIProcessor:
                         if self.max_tokens:
                             api_params["max_tokens"] = self.max_tokens
                         if json_schema:
-                            api_params["response_format"] = {"type": "json_object"} # Assume modo JSON
+                            api_params["response_format"] = {"type": "json_object"}
 
                         response = await self.client.chat.completions.create(**api_params)
                         end_time = time.time()
 
-                        # Parse do conteúdo
                         content = response.choices[0].message.content
                         parsed_content = content
                         if json_schema and content:
                             try:
                                 parsed_content = json.loads(content)
                             except json.JSONDecodeError:
-                                # A resposta não foi um JSON válido, mas a chamada foi um sucesso
-                                # A lógica de validação do resultado deve tratar isso
                                 pass
                         
                         return {
-                            'id': request_id,
-                            'success': True,
-                            'content': parsed_content,
-                            'raw_content': content,
-                            'input_tokens': response.usage.prompt_tokens,
+                            'id': request_id, 'success': True, 'content': parsed_content,
+                            'raw_content': content, 'input_tokens': response.usage.prompt_tokens,
                             'output_tokens': response.usage.completion_tokens,
                             'tokens_used': response.usage.total_tokens,
                             'cached_tokens': getattr(getattr(response.usage, 'prompt_tokens_details', {}), 'cached_tokens', 0),
-                            'api_response_time': end_time - start_time,
-                            'attempts': attempt.retry_state.attempt_number,
+                            'api_response_time': end_time - start_time, 'attempts': attempt.retry_state.attempt_number,
                         }
-
                     except Exception as e:
                         end_time = time.time()
                         error_result = {
-                            'id': request_id,
-                            'success': False,
-                            'error': str(e),
-                            'error_type': type(e).__name__,
-                            'api_response_time': end_time - start_time,
+                            'id': request_id, 'success': False, 'error': str(e),
+                            'error_type': type(e).__name__, 'api_response_time': end_time - start_time,
                             'attempts': attempt.retry_state.attempt_number,
                             'response_headers': dict(getattr(e, 'response', {}).headers or {}),
                         }
-                        # Se for um erro de rate limit, notifica o limiter e levanta a exceção
-                        # para o tenacity tentar novamente após a pausa.
                         if self._is_rate_limit_error(error_result):
                             wait_time = self._extract_wait_time_from_error(error_result)
                             self.rate_limiter.record_api_rate_limit(wait_time)
-                            # Notifica o StatsManager
                             await self.stats_manager.record_rate_limiter_event({
-                                'event_type': 'api_rate_limit_detected',
-                                'wait_time': wait_time
+                                'event_type': 'api_rate_limit_detected', 'wait_time': wait_time
                             }, batch_id)
-                            raise  # Força o retry do Tenacity, que aguardará o wait_fixed
-                        
-                        # Para outros erros, retorna o resultado imediatamente sem retry
+                            raise
                         return error_result
 
         except RetryError as retry_error:
-            # Ocorre se todas as tentativas falharem
             return {
-                'id': request_id,
-                'success': False,
+                'id': request_id, 'success': False,
                 'error': f'Máximo de {MAX_RETRY} tentativas excedido. Último erro: {retry_error.last_attempt.exception()}',
-                'error_type': 'RetryError',
-                'attempts': MAX_RETRY,
+                'error_type': 'RetryError', 'attempts': MAX_RETRY,
             }
         finally:
             await self.stats_manager.record_concurrent_end(batch_id)
     
     async def process_single(
-        self,
-        text: str,
-        prompt_template: str,
+        self, text: str, prompt_template: str,
         json_schema: Optional[Dict[str, Any]] = None,
-        custom_id: Optional[str] = None,
-        **kwargs
+        custom_id: Optional[str] = None, **kwargs
     ) -> Dict[str, Any]:
         """Processa um único texto."""
         request_id = custom_id or f"req_{int(time.time() * 1000)}"
@@ -271,19 +263,16 @@ class AIProcessor:
         
         result = await self._make_api_call(messages, json_schema, request_id)
 
-        # Informa o RateLimiter sobre o resultado para ajuste dinâmico
         self.rate_limiter.record_request_completion(
             tokens_used=result.get('tokens_used', 0),
             success=result.get('success', False)
         )
         
-        # Registra os dados completos no StatsManager
         await self.stats_manager.record_request(
             model=self.model,
             retry_count=max(0, result.get('attempts', 1) - 1),
             **result
         )
-        
         return result
 
     async def _process_item_in_batch(self, item_data, prompt_template, json_schema, batch_id, **kwargs):
@@ -302,50 +291,40 @@ class AIProcessor:
         )
         
         await self.stats_manager.record_request(
-            batch_id=batch_id,
-            model=self.model,
+            batch_id=batch_id, model=self.model,
             retry_count=max(0, result.get('attempts', 1) - 1),
             **result
         )
-
         return result
 
     async def process_batch(
-        self,
-        texts: List[str],
-        prompt_template: str,
+        self, texts: List[str], prompt_template: str,
         json_schema: Optional[Dict[str, Any]] = None,
         batch_id: Optional[str] = None,
-        custom_ids: Optional[List[str]] = None,
-        **kwargs
+        custom_ids: Optional[List[str]] = None, **kwargs
     ) -> Dict[str, Any]:
-        """
-        Processa uma lista de textos em lote com alta concorrência e eficiência.
-        """
+        """Processa uma lista de textos em lote com alta concorrência e eficiência."""
         batch_id = batch_id or f"batch_{int(time.time())}"
         self.stats_manager.start_batch(batch_id)
 
-        if custom_ids and len(custom_ids) != len(texts):
-            raise ValueError("custom_ids deve ter o mesmo tamanho que texts.")
+        # Normaliza e valida os IDs customizados
+        normalized_ids = self._normalize_ids(custom_ids, len(texts))
         
         logger.info(
             f"🚀 Iniciando processamento em lote '{batch_id}' com {len(texts)} itens.",
             extra={'action': 'batch_start', 'batch_id': batch_id, 'total_items': len(texts)}
         )
 
-        # Prepara os dados para cada tarefa
         items_to_process = [
-            (i, texts[i], custom_ids[i] if custom_ids else None)
+            (i, texts[i], normalized_ids[i] if normalized_ids else None)
             for i in range(len(texts))
         ]
 
-        # Cria e executa todas as tarefas concorrentemente
         tasks = [
             asyncio.create_task(self._process_item_in_batch(item, prompt_template, json_schema, batch_id, **kwargs))
             for item in items_to_process
         ]
         
-        # Aguarda a conclusão de todas as tarefas
         results = await asyncio.gather(*tasks)
         
         batch_stats = self.stats_manager.end_batch(batch_id)
@@ -354,9 +333,8 @@ class AIProcessor:
             f"✅ Lote '{batch_id}' concluído. "
             f"Sucesso: {batch_stats.successful_requests}, Falhas: {batch_stats.failed_requests}.",
             extra={
-                'action': 'batch_complete',
-                'batch_id': batch_id,
-                **batch_stats.__dict__ # Loga todas as estatísticas do lote
+                'action': 'batch_complete', 'batch_id': batch_id,
+                **batch_stats.__dict__
             }
         )
         
