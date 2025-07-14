@@ -5,7 +5,7 @@ import logging
 import re
 import os
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Any, Optional, Callable
 
 from tenacity import AsyncRetrying, RetryError, stop_after_attempt, wait_fixed
@@ -98,14 +98,13 @@ class AIProcessor:
         self.temperature = config.get('temperature', 0.1)
         self.max_tokens = config.get('max_tokens')
         
-        # --- Sincronização da Configuração Inicial ---
         max_tpm = config.get('max_tpm', 125000)
         initial_concurrency = config.get('initial_concurrency', INITIAL_CONCURRENCY)
 
+        # **CORREÇÃO**: Removido o argumento 'initial_concurrency' da chamada ao construtor do StatsManager.
         self.stats_manager = StatsManager(
             models_config=self.models_config,
-            max_tpm=max_tpm,
-            initial_concurrency=initial_concurrency
+            max_tpm=max_tpm
         )
         
         self.rate_limiter = AdaptiveRateLimiter(
@@ -350,4 +349,3 @@ class AIProcessor:
     def get_stats_manager(self) -> StatsManager:
         """Retorna a instância do StatsManager para análise externa."""
         return self.stats_manager
-
