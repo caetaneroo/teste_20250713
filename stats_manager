@@ -5,6 +5,7 @@ import statistics
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Dict, Any, Optional, List
+from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
@@ -12,7 +13,7 @@ logger = logging.getLogger(__name__)
 class StatsContainer:
     """
     Um contêiner de dados otimizado para armazenar e calcular métricas de
-    desempenho e custo, com foco em insights de paralelização e clareza.
+    desempenho, com timestamps formatados e insights de paralelização.
     """
     # --- Identificação e Tempo ---
     id: str
@@ -39,16 +40,11 @@ class StatsContainer:
     current_concurrent_requests: int = 0
     concurrent_peak: int = 0
     configured_max_concurrency: int = 0
-
-    # --- Métricas de Rate Limiter ---
-    api_rate_limits_detected: int = 0
-    proactive_pauses: int = 0
-    total_proactive_wait_time: float = 0.0
     
     # --- Propriedades Calculadas (Refinadas) ---
     @property
-    def wall_clock_time(self) -> float:
-        """Tempo real decorrido do início ao fim (tempo de relógio)."""
+    def processing_time(self) -> float:
+        """Tempo real decorrido do início ao fim (corrigido para o nome correto)."""
         if self.end_time:
             return self.end_time - self.start_time
         return time.time() - self.start_time
@@ -61,8 +57,8 @@ class StatsContainer:
     @property
     def parallelization_gain_seconds(self) -> float:
         """Calcula a economia de tempo em segundos obtida com a paralelização."""
-        if self.wall_clock_time > 0:
-            return self.total_api_time - self.wall_clock_time
+        if self.processing_time > 0:
+            return self.total_api_time - self.processing_time
         return 0.0
 
     @property
@@ -71,7 +67,7 @@ class StatsContainer:
         if self.total_api_time > 0:
             return (self.parallelization_gain_seconds / self.total_api_time) * 100
         return 0.0
-
+        
     @property
     def min_api_latency(self) -> float:
         return min(self.api_response_times) if self.api_response_times else 0
@@ -83,6 +79,27 @@ class StatsContainer:
     @property
     def avg_api_latency(self) -> float:
         return statistics.mean(self.api_response_times) if self.api_response_times else 0
+
+    # --- Novas Propriedades para Timestamps Formatados ---
+    @staticmethod
+    def _format_brt(timestamp: float) -> str:
+        """Converte um timestamp Unix para uma string no Horário de Brasília (UTC-3)."""
+        if not timestamp:
+            return "N/A"
+        # Converte para datetime e ajusta para o fuso de Brasília
+        brt_time = datetime.fromtimestamp(timestamp) - timedelta(hours=3)
+        return brt_time.strftime('%Y-%m-%d %H:%M:%S')
+
+    @property
+    def start_time_brt(self) -> str:
+        """Retorna o timestamp de início formatado."""
+        return self._format_brt(self.start_time)
+
+    @property
+    def end_time_brt(self) -> str:
+        """Retorna o timestamp de fim formatado."""
+        return self._format_brt(self.end_time)
+
 
 class StatsManager:
     """
@@ -99,18 +116,12 @@ class StatsManager:
 
     def _get_model_pricing(self, model: str) -> Dict[str, float]:
         model_data = self._models_config.get(model, {})
-        return {
-            'input': model_data.get('input', 0.0),
-            'output': model_data.get('output', 0.0),
-            'cache': model_data.get('cache', 0.0)
-        }
+        return {'input': model_data.get('input', 0.0), 'output': model_data.get('output', 0.0), 'cache': model_data.get('cache', 0.0)}
 
     def _calculate_cost(self, model: str, input_tokens: int, output_tokens: int, cached_tokens: int = 0) -> float:
         pricing = self._get_model_pricing(model)
         regular_input = max(0, input_tokens - cached_tokens)
-        return ((regular_input / 1000) * pricing['input'] +
-                (cached_tokens / 1000) * pricing['cache'] +
-                (output_tokens / 1000) * pricing['output'])
+        return ((regular_input / 1000) * pricing['input'] + (cached_tokens / 1000) * pricing['cache'] + (output_tokens / 1000) * pricing['output'])
 
     async def _update_stats(self, stats: StatsContainer, **kwargs):
         stats.total_requests += 1
@@ -120,9 +131,7 @@ class StatsManager:
             stats.failed_requests += 1
             stats.error_type_counts[kwargs.get('error_type', 'UnknownError')] += 1
         
-        cost = self._calculate_cost(
-            model=kwargs['model'], input_tokens=kwargs.get('input_tokens', 0),
-            output_tokens=kwargs.get('output_tokens', 0), cached_tokens=kwargs.get('cached_tokens', 0))
+        cost = self._calculate_cost(model=kwargs['model'], input_tokens=kwargs.get('input_tokens', 0), output_tokens=kwargs.get('output_tokens', 0), cached_tokens=kwargs.get('cached_tokens', 0))
         stats.total_cost += cost
         stats.total_input_tokens += kwargs.get('input_tokens', 0)
         stats.total_output_tokens += kwargs.get('output_tokens', 0)
@@ -186,14 +195,14 @@ class StatsManager:
         summary = (
             f"📊 RESUMO GERAL:\n"
             f"   - Requisições Totais: {stats.total_requests} (✅ {stats.successful_requests} Sucesso | ❌ {stats.failed_requests} Falhas)\n"
-            f"   - Tempo Real do Lote: {stats.wall_clock_time:.2f}s\n"
-            f"   - Taxa de Sucesso: {(stats.successful_requests / stats.total_requests * 100) if stats.total_requests else 100:.1f}%\n"
+            f"   - Início: {stats.start_time_brt} | Fim: {stats.end_time_brt}\n"
+            f"   - Duração Total: {stats.processing_time:.2f}s\n"
         )
         
         parallelization = (
             f"🚀 EFICIÊNCIA DA PARALELIZAÇÃO:\n"
             f"   - Tempo Total de API (Serial): {stats.total_api_time:.2f}s\n"
-            f"   - Ganho com Paralelização: {stats.parallelization_gain_seconds:.2f}s ({stats.parallelization_gain_percent:.1f}% de economia)\n"
+            f"   - Ganho com Paralelização: {stats.parallelization_gain_seconds:.2f}s ({stats.parallelization_gain_percent:.1f}% de economia de tempo)\n"
         )
 
         performance = (
@@ -229,13 +238,6 @@ class StatsManager:
         """
         Retorna uma string formatada com o resumo completo das estatísticas
         para um lote específico ou para as estatísticas globais.
-
-        Args:
-            batch_id (Optional[str]): O ID do lote para o qual gerar o resumo.
-                                      Se None, gera para as estatísticas globais.
-        
-        Returns:
-            str: O relatório de performance formatado.
         """
         if batch_id:
             stats = self._batch_stats.get(batch_id)
