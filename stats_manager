@@ -45,6 +45,7 @@ class StatsContainer:
     api_rate_limits_detected: int = 0
     proactive_pauses: int = 0
     total_proactive_wait_time: float = 0.0
+    peak_tpm: int = 0  # NOVO: Pico de Tokens Por Minuto observado
     
     # --- Propriedades Calculadas ---
     @property
@@ -111,8 +112,9 @@ class StatsManager:
     com uma interface simplificada e robusta para o usuário.
     """
 
-    def __init__(self, models_config: Dict[str, Any]):
+    def __init__(self, models_config: Dict[str, Any], max_tpm: int):
         self._models_config = models_config
+        self.max_tpm = max_tpm  # Armazena o max_tpm para cálculo de percentual
         self._global_stats = StatsContainer(id="global")
         self._batch_stats: Dict[str, StatsContainer] = {}
         self._lock = asyncio.Lock()
@@ -162,6 +164,10 @@ class StatsManager:
                      stats.api_rate_limits_detected += 1
                 elif event_type == 'concurrency_update':
                     stats.configured_max_concurrency = event.get('new_concurrency', 0)
+                elif event_type == 'token_usage_update':
+                    current_tpm = event.get('current_tpm', 0)
+                    if current_tpm > stats.peak_tpm:
+                        stats.peak_tpm = current_tpm
     
     async def record_concurrent_start(self, batch_id: Optional[str] = None):
         async with self._lock:
@@ -192,7 +198,6 @@ class StatsManager:
         batch_stats = self._batch_stats.get(batch_id)
         if batch_stats:
             batch_stats.end_time = time.time()
-            # Atualiza o tempo final global para refletir o último lote concluído
             self._global_stats.end_time = batch_stats.end_time
             return batch_stats
         return None
@@ -218,11 +223,13 @@ class StatsManager:
             f"   - Ganho com Paralelização: {stats.parallelization_gain_seconds:.2f}s ({stats.parallelization_gain_percent:.1f}% de economia de tempo)\n"
         )
 
+        tpm_usage_percent = (stats.peak_tpm / self.max_tpm * 100) if self.max_tpm > 0 else 0
         performance = (
             f"⏱️ DESEMPENHO E LATÊNCIA:\n"
             f"   - Latência API (min/média/max): {stats.min_api_latency:.1f}s / {stats.avg_api_latency:.1f}s / {stats.max_api_latency:.1f}s\n"
             f"   - Concorrência Configurada (Alvo): {stats.configured_max_concurrency} requisições\n"
             f"   - Pico de Concorrência (Real): {stats.concurrent_peak} requisições\n"
+            f"   - Pico de Consumo TPM: {stats.peak_tpm:,} / {self.max_tpm:,} ({tpm_usage_percent:.1f}% do limite)\n"
         )
 
         cost_consumption = (
@@ -257,4 +264,3 @@ class StatsManager:
             title = "GLOBAL"
         
         return self._format_stats(stats_obj, title)
-
