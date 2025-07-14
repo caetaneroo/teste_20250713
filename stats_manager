@@ -40,11 +40,16 @@ class StatsContainer:
     current_concurrent_requests: int = 0
     concurrent_peak: int = 0
     configured_max_concurrency: int = 0
+
+    # --- Métricas de Rate Limiter ---
+    api_rate_limits_detected: int = 0  # **CORREÇÃO**: Atributo re-adicionado
+    proactive_pauses: int = 0
+    total_proactive_wait_time: float = 0.0
     
-    # --- Propriedades Calculadas (Refinadas) ---
+    # --- Propriedades Calculadas ---
     @property
     def processing_time(self) -> float:
-        """Tempo real decorrido do início ao fim (corrigido para o nome correto)."""
+        """Tempo real decorrido do início ao fim."""
         if self.end_time:
             return self.end_time - self.start_time
         return time.time() - self.start_time
@@ -80,13 +85,12 @@ class StatsContainer:
     def avg_api_latency(self) -> float:
         return statistics.mean(self.api_response_times) if self.api_response_times else 0
 
-    # --- Novas Propriedades para Timestamps Formatados ---
+    # --- Propriedades para Timestamps Formatados ---
     @staticmethod
     def _format_brt(timestamp: float) -> str:
         """Converte um timestamp Unix para uma string no Horário de Brasília (UTC-3)."""
         if not timestamp:
             return "N/A"
-        # Converte para datetime e ajusta para o fuso de Brasília
         brt_time = datetime.fromtimestamp(timestamp) - timedelta(hours=3)
         return brt_time.strftime('%Y-%m-%d %H:%M:%S')
 
@@ -104,7 +108,7 @@ class StatsContainer:
 class StatsManager:
     """
     Gerenciador centralizado para coletar, calcular e apresentar estatísticas,
-    com uma interface simplificada para o usuário.
+    com uma interface simplificada e robusta para o usuário.
     """
 
     def __init__(self, models_config: Dict[str, Any]):
@@ -249,4 +253,3 @@ class StatsManager:
             title = "GLOBAL"
         
         return self._format_stats(stats, title)
-
