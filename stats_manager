@@ -12,8 +12,8 @@ logger = logging.getLogger(__name__)
 @dataclass
 class StatsContainer:
     """
-    Um contêiner de dados otimizado para armazenar e calcular métricas de
-    desempenho, com timestamps formatados e insights de paralelização.
+    Um contêiner de dados robusto e otimizado para armazenar e calcular métricas
+    de desempenho, com timestamps formatados e insights de paralelização.
     """
     # --- Identificação e Tempo ---
     id: str
@@ -42,14 +42,14 @@ class StatsContainer:
     configured_max_concurrency: int = 0
 
     # --- Métricas de Rate Limiter ---
-    api_rate_limits_detected: int = 0  # **CORREÇÃO**: Atributo re-adicionado
+    api_rate_limits_detected: int = 0  # **CORREÇÃO DEFINITIVA**: Atributo re-adicionado.
     proactive_pauses: int = 0
     total_proactive_wait_time: float = 0.0
     
     # --- Propriedades Calculadas ---
     @property
     def processing_time(self) -> float:
-        """Tempo real decorrido do início ao fim."""
+        """Tempo real decorrido do início ao fim (tempo de relógio)."""
         if self.end_time:
             return self.end_time - self.start_time
         return time.time() - self.start_time
@@ -215,11 +215,6 @@ class StatsManager:
             f"   - Concorrência Configurada (Alvo): {stats.configured_max_concurrency} requisições\n"
             f"   - Pico de Concorrência (Real): {stats.concurrent_peak} requisições\n"
         )
-        
-        concurrency_explanation = (
-            f"   💡 *Explicação Simples: Pense em um supermercado. A 'Concorrência Configurada' é quantos caixas a gerência decide abrir (o alvo).\n"
-            f"     O 'Pico de Concorrência' é o número máximo de clientes que realmente estiveram passando nos caixas ao mesmo tempo.*\n"
-        )
 
         cost_consumption = (
             f"💰 CUSTO E CONSUMO DE TOKENS:\n"
@@ -236,7 +231,8 @@ class StatsManager:
 
         footer = "=" * 80
         
-        return (f"\n{header}\n\n{summary}\n{parallelization}\n{performance}\n{concurrency_explanation}\n{cost_consumption}\n{reliability}\n{footer}\n")
+        # **CORREÇÃO**: Explicação de concorrência removida do retorno final.
+        return (f"\n{header}\n\n{summary}\n{parallelization}\n{performance}\n{cost_consumption}\n{reliability}\n{footer}\n")
 
     def get_summary(self, batch_id: Optional[str] = None) -> str:
         """
