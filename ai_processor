@@ -203,7 +203,6 @@ class AIProcessor:
                         if json_schema: api_params["response_format"] = {"type": "json_object"}
                         response = await self.client.chat.completions.create(**api_params)
                         
-                        # Estrutura a resposta de sucesso com os campos desejados
                         input_tokens = response.usage.prompt_tokens
                         output_tokens = response.usage.completion_tokens
                         cached_tokens = getattr(getattr(response.usage, 'prompt_tokens_details', {}), 'cached_tokens', 0)
@@ -214,6 +213,7 @@ class AIProcessor:
                             try: parsed_content = json.loads(content)
                             except json.JSONDecodeError: pass
                         
+                        # Retorna um dicionário não ordenado; a ordenação é responsabilidade do chamador.
                         return {
                             'id': request_id, 'success': True, 'content': parsed_content,
                             'input_tokens': input_tokens, 'output_tokens': output_tokens,
@@ -247,11 +247,43 @@ class AIProcessor:
         finally:
             await self.stats_manager.record_concurrent_end(batch_id)
     
+    def _create_ordered_result(self, result: Dict[str, Any], start_timestamp_iso: str) -> Dict[str, Any]:
+        """Cria um dicionário de resultado final com a ordem de campos especificada."""
+        if result['success']:
+            return {
+                # --- Dados de Processamento ---
+                'id': result.get('id'),
+                'start_timestamp': start_timestamp_iso,
+                'success': result.get('success'),
+                'api_response_time': result.get('api_response_time'),
+                'attempts': result.get('attempts'),
+                # --- Dados de Tokens e Custo ---
+                'input_tokens': result.get('input_tokens'),
+                'output_tokens': result.get('output_tokens'),
+                'cached_tokens': result.get('cached_tokens'),
+                'total_tokens': result.get('total_tokens'),
+                'cost': result.get('cost'),
+                # --- Conteúdo ---
+                'raw_content': result.get('raw_content'),
+                'content': result.get('content'),
+            }
+        else:
+            # Estrutura para erros
+            return {
+                'id': result.get('id'),
+                'start_timestamp': start_timestamp_iso,
+                'success': result.get('success'),
+                'error': result.get('error'),
+                'error_details': result.get('error_details'),
+                'api_response_time': result.get('api_response_time'),
+                'attempts': result.get('attempts'),
+            }
+            
     async def process_single(
         self, text: str, prompt_template: str, json_schema: Optional[Dict[str, Any]] = None,
         custom_id: Optional[str] = None, **kwargs
     ) -> Dict[str, Any]:
-        """Processa um único texto, enriquecendo o resultado com timestamp."""
+        """Processa um único texto, retornando um resultado com estrutura ordenada."""
         start_time_ts = time.time()
         start_timestamp_iso = datetime.fromtimestamp(start_time_ts, tz=timezone.utc).isoformat()
         
@@ -260,18 +292,19 @@ class AIProcessor:
         messages = [{"role": "user", "content": prompt}]
         
         result = await self._make_api_call(messages, json_schema, request_id)
-        result['start_timestamp'] = start_timestamp_iso # Adiciona o timestamp ao resultado final
         
         self.rate_limiter.record_request_completion(
             tokens_used=result.get('total_tokens', 0), success=result.get('success', False))
         
+        # O StatsManager recebe o resultado bruto, a ordem não importa para ele.
         await self.stats_manager.record_request(
             model=self.model, retry_count=max(0, result.get('attempts', 1) - 1), **result)
         
-        return result
+        # Retorna o resultado formatado e ordenado para o usuário final.
+        return self._create_ordered_result(result, start_timestamp_iso)
 
     async def _process_item_in_batch(self, item_data, prompt_template, json_schema, batch_id, progress_tracker, **kwargs):
-        """Função worker que executa uma tarefa e notifica o rastreador de progresso ao final."""
+        """Função worker que executa uma tarefa e retorna um resultado ordenado."""
         start_time_ts = time.time()
         start_timestamp_iso = datetime.fromtimestamp(start_time_ts, tz=timezone.utc).isoformat()
         result = {}
@@ -282,7 +315,6 @@ class AIProcessor:
             messages = [{"role": "user", "content": prompt}]
             
             result = await self._make_api_call(messages, json_schema, request_id, batch_id)
-            result['start_timestamp'] = start_timestamp_iso
             
             self.rate_limiter.record_request_completion(
                 tokens_used=result.get('total_tokens', 0), success=result.get('success', False))
@@ -290,7 +322,7 @@ class AIProcessor:
             await self.stats_manager.record_request(
                 batch_id=batch_id, model=self.model, retry_count=max(0, result.get('attempts', 1) - 1), **result)
             
-            return result
+            return self._create_ordered_result(result, start_timestamp_iso)
         finally:
             await progress_tracker.increment_and_log()
 
@@ -299,7 +331,6 @@ class AIProcessor:
         batch_id: Optional[str] = None, custom_ids: Optional[Any] = None, **kwargs
     ) -> Dict[str, Any]:
         """Processa uma lista de textos em lote com logs de progresso e erros detalhados."""
-        # Garante que o batch_id seja sempre único
         unique_timestamp = int(time.time())
         if batch_id:
             batch_id = f"{batch_id}_{unique_timestamp}"
@@ -330,7 +361,6 @@ class AIProcessor:
         
         batch_stats = self.stats_manager.end_batch(batch_id)
         
-        # Estrutura os dados do log final para maior clareza
         log_extra = {
             'action': 'batch_complete', 'batch_id': batch_id,
             'successful_requests': batch_stats.successful_requests,
