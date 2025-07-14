@@ -49,28 +49,32 @@ class StatsContainer:
     peak_tpm: int = 0
 
     def __post_init__(self):
-        # Inicializa a concorrência configurada com o valor inicial
+        # Garante que a concorrência configurada seja inicializada corretamente.
         self.configured_max_concurrency = self.initial_concurrency
 
     # --- Propriedades Calculadas ---
     @property
     def processing_time(self) -> float:
+        """Tempo real decorrido do início ao fim (tempo de relógio)."""
         if self.end_time:
             return self.end_time - self.start_time
         return time.time() - self.start_time
 
     @property
     def total_api_time(self) -> float:
+        """Soma de todos os tempos de resposta da API (tempo serial)."""
         return sum(self.api_response_times)
 
     @property
     def parallelization_gain_seconds(self) -> float:
+        """Calcula a economia de tempo em segundos obtida com a paralelização."""
         if self.processing_time > 0:
             return self.total_api_time - self.processing_time
         return 0.0
 
     @property
     def parallelization_gain_percent(self) -> float:
+        """Calcula a economia de tempo em porcentagem."""
         if self.total_api_time > 0:
             return (self.parallelization_gain_seconds / self.total_api_time) * 100
         return 0.0
@@ -87,18 +91,23 @@ class StatsContainer:
     def avg_api_latency(self) -> float:
         return statistics.mean(self.api_response_times) if self.api_response_times else 0
 
+    # --- Propriedades para Timestamps Formatados ---
     @staticmethod
     def _format_brt(timestamp: float) -> str:
-        if not timestamp: return "N/A"
+        """Converte um timestamp Unix para uma string no Horário de Brasília (UTC-3)."""
+        if not timestamp:
+            return "N/A"
         brt_time = datetime.fromtimestamp(timestamp) - timedelta(hours=3)
         return brt_time.strftime('%Y-%m-%d %H:%M:%S')
 
     @property
     def start_time_brt(self) -> str:
+        """Retorna o timestamp de início formatado."""
         return self._format_brt(self.start_time)
 
     @property
     def end_time_brt(self) -> str:
+        """Retorna o timestamp de fim formatado."""
         return self._format_brt(self.end_time)
 
 
@@ -111,11 +120,11 @@ class StatsManager:
     def __init__(self, models_config: Dict[str, Any], max_tpm: int, initial_concurrency: int):
         self._models_config = models_config
         self.max_tpm = max_tpm
+        self.initial_concurrency = initial_concurrency
         self._global_stats = StatsContainer(id="global", initial_concurrency=initial_concurrency)
         self._batch_stats: Dict[str, StatsContainer] = {}
         self._lock = asyncio.Lock()
         self._last_batch_id: Optional[str] = None
-        self.initial_concurrency = initial_concurrency
         logger.info("StatsManager inicializado e pronto para gerar insights.")
 
     def _get_model_pricing(self, model: str) -> Dict[str, float]:
@@ -161,7 +170,7 @@ class StatsManager:
                      stats.api_rate_limits_detected += 1
                 elif event_type == 'concurrency_update':
                     stats.configured_max_concurrency = event.get('new_concurrency', 0)
-                elif event_type == 'token_usage_update':
+                elif event_type == 'token_usage_update': # CORREÇÃO: Nome do evento correto
                     current_tpm = event.get('current_tpm', 0)
                     if current_tpm > stats.peak_tpm:
                         stats.peak_tpm = current_tpm
@@ -188,6 +197,7 @@ class StatsManager:
         if batch_id in self._batch_stats:
             logger.warning(f"Batch com ID '{batch_id}' já existe. Sobrescrevendo estatísticas.")
         self._last_batch_id = batch_id
+        # CORREÇÃO: Garante que o contêiner do lote seja inicializado com a concorrência correta
         self._batch_stats[batch_id] = StatsContainer(id=batch_id, initial_concurrency=self.initial_concurrency)
         logger.info(f"Lote de estatísticas '{batch_id}' iniciado.")
 
@@ -200,6 +210,7 @@ class StatsManager:
         return None
 
     def get_global_stats(self) -> StatsContainer:
+        """Retorna o objeto de estatísticas globais."""
         return self._global_stats
 
     def _format_stats(self, stats: StatsContainer, title: str) -> str:
@@ -260,4 +271,3 @@ class StatsManager:
             title = "GLOBAL"
         
         return self._format_stats(stats_obj, title)
-
